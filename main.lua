@@ -1103,10 +1103,28 @@ end
 
 -- How many more fish this cast can take, from the cast HUD's "caught/cap"
 -- counter. Rod and bait upgrades change cap, so it is read every plan.
+-- Capacity as the Upgrades menu lists it ("13 Fishes"), the fallback when
+-- the cast counter can't be read
+local function upgradeCapacity()
+    local up = pg:FindFirstChild("Interfaces")
+    up = up and up:FindFirstChild("Upgrades")
+    if not up then return nil end
+    for _, d in ipairs(up:GetDescendants()) do
+        if d.ClassName == "TextLabel" and d.Name == "UpgradeName" and txt(d) == "CAPACITY" then
+            local amount = d.Parent and findLabel(d.Parent, "Amount")
+            local n = amount and tonumber((txt(amount) or ""):match("(%d+)"))
+            if n and n > 0 then return n end
+        end
+    end
+end
+
 local function slotsLeft()
     local a, b = (txt(R.fishAmount) or ""):match("(%d+)%s*/%s*(%d+)")
     a, b = tonumber(a), tonumber(b)
-    if not (a and b and b > 0) then return 3, 3, 0 end
+    if not (a and b and b > 0) then
+        local cap = upgradeCapacity() or 3
+        return cap, cap, 0
+    end
     -- Right after a cast starts the counter can still show the last cast's
     -- count. Until this cast has caught something, every slot is free.
     -- (The third value stays the raw count: catch tracking diffs it.)
