@@ -1802,15 +1802,19 @@ local function renderStep(dt)
     if goalLat then
         local hazards = {}
         local rise = math.max(Cast.rise or 10, 2)
-        local window = direct and rise * 0.8 or 10
+        local window = direct and rise * 1.2 or 10
         local limit = targetPos and math.min(window, (Steer.targetGap or window) - 1) or window
-        local pad = 1.5
+        local pad = 2.5
         for _, f in ipairs(School) do
             -- junk always (when avoiding it); any other fish too when the
             -- route already needs every slot left, since it would steal one
             local routeFull = Steer.route and #Steer.route > 0 and #Steer.route >= (Steer.slotsLeft or 99)
             local inRoute = Steer.routeIds and Steer.routeIds[f.id or 0]
-            local obstacle = (S.avoidJunk and f.useless) or (routeFull and not inRoute)
+            -- anything the plan didn't choose is in the way: with spare slots it
+            -- used to grab cheap fish along the route
+            -- ("Avoid useless" off: junk is only dodged when the route needs
+            -- every slot)
+            local obstacle = not inRoute and (S.avoidJunk or not f.useless or routeFull)
             if obstacle and not Steer.caught[f.id or 0] then
                 local pos = entryPos(f)
                 if pos then
@@ -1842,7 +1846,7 @@ local function renderStep(dt)
         -- wall: don't slide across its lane until the bait has risen past it.
         local baitLat = baitPos:Dot(axis)
         for _, h in ipairs(hazards) do
-            if h.gap < rise * 0.35 then
+            if h.gap < rise * 0.6 then
                 local lo, hi = h.lat - h.r, h.lat + h.r
                 if baitLat <= lo and goalLat > lo then
                     goalLat = lo
@@ -2057,6 +2061,21 @@ do
     if type(cls) == "table" and not rawget(cls, "__deepfishSafe") then
         cls.__deepfishSafe = true
         -- position of the callback among each method's arguments (after self)
+        -- Labels too: the library calls a label's text function inside its own
+        -- frame loop, so one error there froze the whole menu and the box
+        local origLabel = cls.Label
+        if type(origLabel) == "function" then
+            cls.Label = function(self, text, ...)
+                if type(text) == "function" then
+                    local fn = text
+                    text = function()
+                        local ok, v = pcall(fn)
+                        return ok and tostring(v) or "-"
+                    end
+                end
+                return origLabel(self, text, ...)
+            end
+        end
         for name, at in pairs({ Toggle = 3, Button = 2, Slider = 7, Dropdown = 5, Textbox = 3, Keybind = 3 }) do
             local orig = cls[name]
             if type(orig) == "function" then
@@ -2300,7 +2319,6 @@ local boxLines = {
         local t = Steer.target
         return "Next: " .. (t and t.name or "-")
     end },
-    { line = box:Stat(""), get = function() return "Bag: " .. (txt(R.invFish) or "?") end },
     { line = box:Stat(""), get = function() return "Event: " .. (txt(R.event) or "?") end },
     { line = box:Stat(""), get = function() return "Catches: " .. tostring(Stats.catches) end },
     { line = box:Stat(""), get = function()
