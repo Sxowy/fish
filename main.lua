@@ -1,11 +1,21 @@
 -- Deep Fishing hub for Matcha, UI by INSUI
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/Sxowy/fish/main/main.lua"))()
 
--- a previous copy stops its loops here; its menu removes itself once the
--- fresh library below registers as the new instance
-if _G.DeepFishHub and _G.DeepFishHub.Unload then
-    pcall(_G.DeepFishHub.Unload, true)
+-- Running this again over a live copy: unload the old one fully, then give
+-- its menu time to tear itself down before a new menu exists. Loading the
+-- new library while the old one is mid-frame errors or crashes Matcha.
+-- Each load takes a ticket. If two loads overlap, only the newest one starts:
+-- two copies running at once both steer the same bait and fight each other.
+_G.DeepFishLoadId = (_G.DeepFishLoadId or 0) + 1
+local myLoad = _G.DeepFishLoadId
+
+local previous = _G.DeepFishHub
+_G.DeepFishHub = nil
+if previous and previous.Unload then
+    pcall(previous.Unload)
 end
+
+local function main()
 
 local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))() or INSUI
 
@@ -17,7 +27,7 @@ local hud = pg:WaitForChild("HUD")
 local camera = workspace.CurrentCamera
 local mouse = lp:GetMouse()
 
-local Hub = { running = true, conns = {}, drawings = {} }
+local Hub = { running = true, conns = {}, drawings = {}, spawnSeen = {} }
 _G.DeepFishHub = Hub
 
 -- settings, written by the menu
@@ -29,15 +39,30 @@ local S = {
     autoFight = true,
     clickRate = 11,
     autoSteer = true,
-    steerItems = true,
+    autoEquip = true,
+    fullGuard = true,
+    staffGuard = true,
+    webhook = false,
+    webhookUrl = "",
+    summaryMins = 0,
+    spawnAlert = true,
+    spawnAlertMin = 100000,
+    keyCast = "F6",
+    keySteer = "F7",
+    keyEsp = "F8",
+    keyPanic = "End",
     avoidJunk = true,
-    steerSmooth = 0.45,
+    steerSpeed = 4,
+    steerMode = "Direct",
+    goForItems = true,
+    targetMode = "Value",
+    minValue = 100,
     fishEsp = false,
     espJunk = false,
     eventAlerts = true,
     rareEventsOnly = false,
     catchAlerts = true,
-    catchAlertMin = 300,
+    catchAlertMin = 100000,
     antiAfk = true,
 }
 
@@ -92,9 +117,15 @@ local function menuOpen()
     return ok and v == true
 end
 
--- automation only acts while Roblox is focused and the menu is closed,
--- because the menu holds game input back while it is open
+-- set by the staff detector; menu handles are filled in once the menu exists
+local Guard = { staff = nil }
+local UI = {}
+
+-- automation only acts while Roblox is focused and the menu is closed
+-- (the menu holds game input back while it is open), and never while a
+-- staff member is in the server with the staff guard on
 local function canAct()
+    if S.staffGuard and Guard.staff then return false end
     return focused() and not menuOpen()
 end
 
@@ -112,11 +143,25 @@ local function resolveRefs()
     R.fight = fishingHud and findLabel(fishingHud:FindFirstChild("CatchMinigame"), "Amount")
     R.fishAmount = fishingHud and findLabel(fishingHud:FindFirstChild("FishAmount"), "Amount")
     R.throwDist = findLabel(header, "ThrowDistance")
+    R.nextEvent = findLabel(header, "NextEvent")
     R.event = findLabel(header, "EventName")
     R.location = findLabel(header, "LocationName")
     R.cash = left and findLabel(left:FindFirstChild("Stats"), "Amount")
     local right = hud:FindFirstChild("Right")
     R.notifs = right and right:FindFirstChild("FishesReceivedNotification")
+    local footer = hud:FindFirstChild("Footer")
+    R.hotbar = footer and footer:FindFirstChild("Hotbar")
+    local inv = pg:FindFirstChild("Interfaces")
+    inv = inv and inv:FindFirstChild("Inventory")
+    R.invFish = nil
+    if inv then
+        for _, d in ipairs(inv:GetDescendants()) do
+            if d.Name == "Amount" and d.ClassName == "TextLabel" and d.Parent and d.Parent.Name == "Fish" then
+                R.invFish = d
+                break
+            end
+        end
+    end
     -- hook meter: count the step frames to find where Perfect sits
     local hook = fishingHud and fishingHud:FindFirstChild("Hook")
     local edge = hook and hook:FindFirstChild("LeftEdge")
@@ -133,15 +178,227 @@ end
 resolveRefs()
 
 ---------------------------------------------------------------------------
--- fish database: odds from the Index menu, rarity learned from catches
+-- fish database: sell price and rarity per fish, odds from the Index menu
 ---------------------------------------------------------------------------
 
-local Odds = {}
-local RarityOf = {}
+-- sell price and rarity per fish, dumped from the game's item data.
+-- "Refresh prices" in the menu rescans memory if the game adds fish.
+local BuiltinPrices = {
+    ["Anchorbone Reaper"] = { 120000000000, "Exotic" },
+    ["Anglerfish"] = { 2000000, "Mythic" },
+    ["Anvilhead Forgeshark"] = { 19000000000, "Secret" },
+    ["Archerfish"] = { 20200, "Epic" },
+    ["Arctic Grayling"] = { 170000, "Uncommon" },
+    ["Ashback Carp"] = { 5000000, "Uncommon" },
+    ["Atollwake Leviathan"] = { 2000000, "Secret" },
+    ["Aurorift Humpback"] = { 500000000, "Secret" },
+    ["Barracuda"] = { 11200, "Legendary" },
+    ["Basalt Goby"] = { 3000000, "Common" },
+    ["Bass"] = { 79, "" },
+    ["Big Mouth"] = { 12000000, "Exclusive" },
+    ["Blacktip Shark"] = { 1800000, "Secret" },
+    ["Blaze Seahorse"] = { 70000000, "Legendary" },
+    ["Blazewing Glider"] = { 90000000, "Legendary" },
+    ["Bloodtide Megamaw"] = { 2100000, "Secret" },
+    ["Bloomspike Behemoth"] = { 120000, "Mythic" },
+    ["Blue Tang"] = { 280, "" },
+    ["Blue Whale"] = { 400000000, "" },
+    ["Bonewake Coelacanth"] = { 60000000, "Exotic" },
+    ["Borealis Guppy"] = { 400000, "Epic" },
+    ["Boxfish"] = { 1350, "Epic" },
+    ["Brimstone Barracuda"] = { 12000000, "Epic" },
+    ["Brown Trout"] = { 8980, "Uncommon" },
+    ["Bull Orca"] = { 70000000, "Mythic" },
+    ["Bull Shark"] = { 2810000, "Mythic" },
+    ["Butterflyfish"] = { 1120, "Epic" },
+    ["Caldera Leviathan"] = { 1200000000, "Mythic" },
+    ["Carp"] = { 26, "Common" },
+    ["Catfish"] = { 10100, "Uncommon" },
+    ["Cathedral Nautilus"] = { 450000000, "Secret" },
+    ["Cinder Minnow"] = { 2700000, "Common" },
+    ["Cinderclaw Sovereign"] = { 14000000000, "Secret" },
+    ["Cinderjaw Piranha"] = { 8000000, "Rare" },
+    ["Cindermaw Angler"] = { 50000000000, "Exotic" },
+    ["Clownfish"] = { 247, "Rare" },
+    ["Coalback Sturgeon"] = { 11000000, "Epic" },
+    ["Coalspark Dart"] = { 8000000, "Rare" },
+    ["Coinback Grouper"] = { 10000, "Legendary" },
+    ["Collosal Kraken"] = { 0, "Exclusive" },
+    ["Coral Goby"] = { 1180, "Epic" },
+    ["Coralcoil Kraken"] = { 2400000, "Secret" },
+    ["Coralflare Batfish"] = { 11000, "Legendary" },
+    ["Corona Phoenixfin"] = { 16000000000, "Secret" },
+    ["Cowfish"] = { 1400, "Epic" },
+    ["Crab"] = { 65, "Uncommon" },
+    ["Crestbreaker Thresher"] = { 130000, "Mythic" },
+    ["Crestwake Oarfish"] = { 9000000, "Exotic" },
+    ["Crocodile"] = { 2700000, "" },
+    ["Crownbreaker Leviathan"] = { 5000000000, "Exclusive" },
+    ["Crownreef Manta"] = { 150000, "Mythic" },
+    ["Cushion Star"] = { 112000, "Legendary" },
+    ["Dreadwake Basilosaur"] = { 24000000, "Secret" },
+    ["Duck"] = { 7850, "" },
+    ["Dune Glowgoby"] = { 12500, "Rare" },
+    ["Duneband Sole"] = { 21000, "Epic" },
+    ["Duneblade Guitarfish"] = { 2600000, "Mythic" },
+    ["Dunecrown Scyllarid"] = { 23000000, "Secret" },
+    ["Duneworm Colossus"] = { 90000000, "Exotic" },
+    ["Duskfang Scorpion"] = { 230000000, "Exotic" },
+    ["Eagle Ray"] = { 146000, "Legendary" },
+    ["Eel"] = { 1800, "Epic" },
+    ["Emberback Caldera"] = { 12000000000, "Secret" },
+    ["Emberfin"] = { 2400000, "Common" },
+    ["Emberscale Turtle"] = { 15000000, "Epic" },
+    ["Emberthrone Koi"] = { 1800000000, "Mythic" },
+    ["Firecoral Lionfish"] = { 12000000, "Epic" },
+    ["Firefly Tetra"] = { 1200, "Epic" },
+    ["Flounder"] = { 13500, "Rare" },
+    ["Flying Fish"] = { 350000, "Epic" },
+    ["Frog"] = { 4490, "Common" },
+    ["Frost Serpent"] = { 600000000, "Secret" },
+    ["Frostbite Sprat"] = { 275000, "Rare" },
+    ["Frostcrown Beluga"] = { 50000000, "Mythic" },
+    ["Frostglass Fangtooth"] = { 2300000, "Legendary" },
+    ["Frostspine"] = { 400000, "" },
+    ["Frozen Warden"] = { 10000000000, "Exotic" },
+    ["Giant Squid"] = { 180000, "Legendary" },
+    ["Gilded Crownurchin"] = { 26000000, "Secret" },
+    ["Gilded Gaper"] = { 130000, "Legendary" },
+    ["Glacierback Ankylos"] = { 4500000000, "Exotic" },
+    ["Glassjaw Smelt"] = { 400000, "Epic" },
+    ["Glasswing Sphinx"] = { 1100000000, "Exotic" },
+    ["Goldfish"] = { 17, "Common" },
+    ["Grand Vizier Angler"] = { 2150000, "Secret" },
+    ["Great White Shark"] = { 160000, "Mythic" },
+    ["Grouper"] = { 28100, "Epic" },
+    ["Hammerhead Shark"] = { 400000, "Epic" },
+    ["Hawkfish"] = { 19100, "Epic" },
+    ["Hearthsun Mola"] = { 15000000000, "Secret" },
+    ["Herald Ray"] = { 135000, "Mythic" },
+    ["Hoarfrost Curldancer"] = { 2600000, "" },
+    ["Icebreaker Wolffish"] = { 60000000, "Mythic" },
+    ["Icefish"] = { 100000, "Common" },
+    ["Ironjaw Dunkleost"] = { 17000000, "Exotic" },
+    ["Jackal Nightpike"] = { 2650000, "Mythic" },
+    ["Jellyfish"] = { 135000, "Legendary" },
+    ["Jester Lionfish"] = { 10000, "Legendary" },
+    ["Kelpcrown Seadragon"] = { 30000000, "Exotic" },
+    ["King Crab"] = { 146000, "Legendary" },
+    ["Knightfin Swordfish"] = { 135000, "Mythic" },
+    ["Kraken"] = { 2500000, "Legendary" },
+    ["Lanternjaw"] = { 2000000, "" },
+    ["Lavalamp Jelly"] = { 60000000, "Legendary" },
+    ["Leviathan"] = { 40000000, "" },
+    ["Lionfish"] = { 1570, "" },
+    ["Lobster"] = { 1680, "Epic" },
+    ["Lotusdream Axolotl"] = { 450000000, "Secret" },
+    ["Lullaby Lanternfish"] = { 10000, "Legendary" },
+    ["Magma Mantis"] = { 80000000, "Legendary" },
+    ["Magma Puffer"] = { 6000000, "" },
+    ["Magmafang Basilisk"] = { 300000000000, "Exotic" },
+    ["Magmaw Snapper"] = { 12000000, "Epic" },
+    ["Mandarinfish"] = { 13500, "Rare" },
+    ["Manta Ray"] = { 12000, "Legendary" },
+    ["Megalodon"] = { 29000000, "" },
+    ["Mirage Djinn Eel"] = { 23500000, "Secret" },
+    ["Mirage Mantis"] = { 140000, "Legendary" },
+    ["Moon Jelly"] = { 123000, "Legendary" },
+    ["Moonbeam Minnow"] = { 235, "Rare" },
+    ["Moorish Idol"] = { 23600, "Epic" },
+    ["Mosaic Parrotfin"] = { 1100, "Epic" },
+    ["Mosasaurus"] = { 3000000, "Legendary" },
+    ["Nightcap Dreamer"] = { 145000, "Mythic" },
+    ["Northstar Wyrm"] = { 475000000, "Secret" },
+    ["Nurse Shark"] = { 450000, "Epic" },
+    ["Oasis Moon Koi"] = { 125000, "Legendary" },
+    ["Obelisk Cuirass"] = { 120000, "Legendary" },
+    ["Obsidian Eel"] = { 7000000, "Rare" },
+    ["Obsidian Moth-Ray"] = { 80000000, "Legendary" },
+    ["Obsidian Swordtyrant"] = { 2000000000, "Mythic" },
+    ["Orca"] = { 2500000, "Secret" },
+    ["Page Puffer"] = { 1300, "Epic" },
+    ["Pearlblossom Empress"] = { 1800000, "Secret" },
+    ["Pearlfish"] = { 11200, "Uncommon" },
+    ["Penguin"] = { 350000, "Epic" },
+    ["Pike"] = { 450000, "Epic" },
+    ["Pilchard"] = { 80000, "Common" },
+    ["Plesiosaur"] = { 21000000, "Secret" },
+    ["Polar Owlfish"] = { 2400000, "Legendary" },
+    ["Polarstar Angler"] = { 500000000, "Secret" },
+    ["Prismveil Cuttlefish"] = { 9000, "Legendary" },
+    ["Pufferfish"] = { 1290, "Epic" },
+    ["Pumice Ray"] = { 9000000, "Rare" },
+    ["Purple Tang"] = { 15700, "Rare" },
+    ["Pygmy Seahorse"] = { 190000, "Uncommon" },
+    ["Pyre Hydra"] = { 17000000000, "Secret" },
+    ["Pyroclast Kraken"] = { 1400000000, "Mythic" },
+    ["Rainbow Trout"] = { 290000, "Rare" },
+    ["Red Snapper"] = { 25800, "Epic" },
+    ["Redmoon Salamander"] = { 1500000000, "Mythic" },
+    ["Reef Squid"] = { 210000, "Uncommon" },
+    ["Reefmaw Goliath"] = { 150000, "Mythic" },
+    ["Regal Tang"] = { 14600, "Rare" },
+    ["Rekin"] = { 10000000, "Exclusive" },
+    ["Ribboncrest Hogfish"] = { 1200, "Epic" },
+    ["Rimecrown Stag"] = { 23000000000, "Exotic" },
+    ["Rimefang Greenland"] = { 45000000, "Mythic" },
+    ["Rimeplate Lumpsucker"] = { 350000, "" },
+    ["Roselight Medusa"] = { 10000, "Legendary" },
+    ["Sailfish"] = { 11200, "Legendary" },
+    ["Sardine"] = { 19, "Common" },
+    ["Scarab Nightfin"] = { 20500, "Epic" },
+    ["Scorchtail Darter"] = { 6000000, "Uncommon" },
+    ["Sea Turtle"] = { 230000, "Rare" },
+    ["Seahorse"] = { 213, "Rare" },
+    ["Seal"] = { 500000, "Epic" },
+    ["Sepulcher Gulper"] = { 27000000, "Secret" },
+    ["Shrimp"] = { 55, "Uncommon" },
+    ["Siltwhisker Goatfish"] = { 18000, "Epic" },
+    ["Slagfin Snapper"] = { 11000000, "Epic" },
+    ["Smokestack Catfish"] = { 16000000, "Epic" },
+    ["Snapping Turtle"] = { 260000, "Rare" },
+    ["Snowglobe Puffer"] = { 47500000, "Mythic" },
+    ["Snowruff Sculpin"] = { 450000, "Epic" },
+    ["Spiny Lobster"] = { 140000, "Legendary" },
+    ["Squid"] = { 110000, "Mythic" },
+    ["Starfall Moonray"] = { 2050000, "Secret" },
+    ["Starfish"] = { 90, "" },
+    ["Stingray"] = { 10100, "Legendary" },
+    ["Sulphur Perch"] = { 5000000, "Uncommon" },
+    ["Sunken King"] = { 0, "Exclusive" },
+    ["Sunken Pharaoh"] = { 500000000, "Exotic" },
+    ["Sunspine Sturgeon"] = { 2700000, "Mythic" },
+    ["Sunspot Triggerfin"] = { 1400, "Epic" },
+    ["Sunwheel Stingaree"] = { 110000, "Legendary" },
+    ["Surgeonfish"] = { 18000, "Epic" },
+    ["Swordfish"] = { 12300, "Legendary" },
+    ["Tempest Sawfin"] = { 1900000, "Secret" },
+    ["The Sunken Queen"] = { 0, "Exclusive" },
+    ["Tideforge Archelon"] = { 2300000, "" },
+    ["Tidesong Ribbonjaw"] = { 10000, "Legendary" },
+    ["Tiger Shark"] = { 140000, "Mythic" },
+    ["Trumpetfish"] = { 23600, "Epic" },
+    ["Tuna"] = { 8980, "Legendary" },
+    ["Tuskbreaker Narwhal"] = { 1700000000, "Exotic" },
+    ["Vent Crab"] = { 8000000, "Rare" },
+    ["Volcrown Megalodon"] = { 700000000000, "Exotic" },
+    ["Vulcanheart Wyrm"] = { 1600000000, "Mythic" },
+    ["Wels Catfish"] = { 2200000, "Legendary" },
+    ["Whale"] = { 3500000, "" },
+    ["Wobbegong"] = { 3250000, "Mythic" },
+    ["Wrasse"] = { 22400, "Epic" },
+    ["Wrathclaw Warlord"] = { 22000000, "Secret" },
+    ["Wreckback Hermit"] = { 4000000, "Exotic" },
+    ["Yellow Tang"] = { 314, "Rare" },
+}
+
+local Price = {}     -- name -> sell price
+local RarityOf = {}  -- name -> rarity
+local Odds = {}      -- name -> 1 in N, from the Index
 local ItemNames = {}
 local JunkNames = {}
+local PRICE_FILE = "deepfishing/prices.json"
 
-local RarityOrder = { Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5, Mythic = 6, Secret = 7, Exotic = 8, Exclusive = 9 }
 local RarityColor = {
     Common = Color3.fromRGB(190, 190, 190),
     Uncommon = Color3.fromRGB(90, 220, 110),
@@ -155,15 +412,47 @@ local RarityColor = {
 }
 local ItemColor = Color3.fromRGB(255, 170, 60)
 
-local function rarityFromOdds(n)
-    if not n then return nil end
-    if n < 10 then return "Common" end
-    if n < 80 then return "Uncommon" end
-    if n < 800 then return "Rare" end
-    if n < 8000 then return "Epic" end
-    if n < 80000 then return "Legendary" end
-    if n < 800000 then return "Mythic" end
-    return "Secret"
+local function applyPrices(list)
+    for name, v in pairs(list) do
+        local p, r = v[1] or v.p, v[2] or v.r
+        if tonumber(p) then Price[name] = tonumber(p) end
+        if r and r ~= "" then RarityOf[name] = r end
+    end
+end
+
+applyPrices(BuiltinPrices)
+pcall(function()
+    if isfile(PRICE_FILE) then
+        applyPrices(game:GetService("HttpService"):JSONDecode(readfile(PRICE_FILE)))
+    end
+end)
+
+-- full heap scan for every item table with a SellPrice. Slow (~5s), so it
+-- only runs from the menu, and the result is cached to a file
+local function refreshPrices()
+    local res = getgc({ "SellPrice", "UIName", "Rarity" })
+    local byTbl = {}
+    for _, e in ipairs(res) do
+        local key = tostring(e.tbl)
+        byTbl[key] = byTbl[key] or {}
+        byTbl[key][e.key] = e.value
+    end
+    local function unquote(s) return (tostring(s or ""):gsub('^"', ""):gsub('"$', "")) end
+    local out, n = {}, 0
+    for _, f in pairs(byTbl) do
+        local price = tonumber(tostring(f.SellPrice))
+        if price and f.UIName then
+            local name = unquote(f.UIName)
+            if not out[name] then
+                out[name] = { p = price, r = unquote(f.Rarity) }
+                n = n + 1
+            end
+        end
+    end
+    applyPrices(out)
+    pcall(makefolder, "deepfishing")
+    pcall(writefile, PRICE_FILE, game:GetService("HttpService"):JSONEncode(out))
+    return n
 end
 
 local function loadDatabase()
@@ -193,16 +482,31 @@ end
 loadDatabase()
 
 local function fishRarity(name)
-    return RarityOf[name] or rarityFromOdds(Odds[name])
+    return RarityOf[name]
 end
 
--- higher is more worth chasing
+-- Items (enchant stones, scrolls, chests, keys, baits...) have no sell price
+-- in the game data. With "Go for items" on they simply outrank every fish:
+-- this number only orders the route planner, it is never shown as money
+local ITEM_PRIORITY = 1e13
+
+-- what a target is worth chasing. nil means not tracked at all
 local function targetScore(name)
-    if JunkNames[name] then return S.avoidJunk and -1 or 0 end
-    if ItemNames[name] then return S.steerItems and 1e9 or 0 end
-    local o = Odds[name]
-    if o then return o end
-    return nil
+    if JunkNames[name] then return 0 end
+    if ItemNames[name] then return S.goForItems and ITEM_PRIORITY or 0 end
+    return Price[name]
+end
+
+local function fmtShort(n)
+    if not n then return "?" end
+    for _, u in ipairs({ { 1e12, "T" }, { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" } }) do
+        if n >= u[1] then
+            local v = n / u[1]
+            local s = v >= 100 and string.format("%.0f", v) or string.format("%.1f", v)
+            return "$" .. s:gsub("%.0$", "") .. u[2]
+        end
+    end
+    return "$" .. string.format("%.0f", n)
 end
 
 ---------------------------------------------------------------------------
@@ -212,48 +516,71 @@ end
 local Stats = {
     start = os.clock(),
     casts = 0, perfects = 0, catches = 0, fights = 0, fightsWon = 0,
-    earned = 0, spent = 0,
+    earned = 0, spent = 0, caughtValue = 0,
     byRarity = {},
-    best = nil, bestOdds = 0,
+    best = nil, bestValue = 0,
     lastCash = nil,
 }
 
-local seenNotifs = {}
+local CatchLog = {}       -- newest first, capped
+local CATCH_LOG_MAX = 100
 
-local function scanCatches(report)
-    local root = R.notifs
-    if not root then return end
-    for _, c in ipairs(root:GetChildren()) do
-        if c.Name == "Notification" then
-            local cont = c:FindFirstChild("Container")
-            if cont then
-                local name = txt(findLabel(cont, "ItemName")) or "?"
-                local rarity = txt(findLabel(cont, "Rarity")) or "?"
-                local mut = txt(findLabel(cont, "Mutation")) or ""
-                local weight = txt(findLabel(cont, "Weight")) or ""
-                local key = name .. "|" .. rarity .. "|" .. mut .. "|" .. weight
-                if not seenNotifs[key] then
-                    seenNotifs[key] = true
-                    if report then
-                        Stats.catches = Stats.catches + 1
-                        Stats.byRarity[rarity] = (Stats.byRarity[rarity] or 0) + 1
-                        if RarityOrder[rarity] then RarityOf[name] = rarity end
-                        local o = Odds[name] or 0
-                        if o >= Stats.bestOdds then
-                            Stats.bestOdds = o
-                            Stats.best = name .. " (" .. rarity .. ")"
-                        end
-                        if S.catchAlerts and o >= S.catchAlertMin then
-                            Lib:Notify("Nice catch", string.format("%s  %s  %s  1 in %s", name, rarity, mut, tostring(o)), 5, "success")
-                        end
-                    end
-                end
-            end
-        end
-    end
+-- Discord webhook: only discord.com webhook URLs are accepted, so a typo
+-- can't send catch data somewhere else
+local function validWebhook(url)
+    return type(url) == "string"
+        and (url:match("^https://discord%.com/api/webhooks/%d+/[%w_%-]+$")
+            or url:match("^https://discordapp%.com/api/webhooks/%d+/[%w_%-]+$")) ~= nil
 end
 
-scanCatches(false)
+local function sendWebhook(text)
+    local url = S.webhookUrl
+    if not (S.webhook and validWebhook(url)) then return false end
+    task.spawn(function()
+        local body = game:GetService("HttpService"):JSONEncode({ content = text })
+        local ok, err = pcall(httppost, url, body, "application/json")
+        if not ok then warn("[DeepFish] webhook: " .. tostring(err)) end
+    end)
+    return true
+end
+
+local function logCatch(name, rarity, mut, weight, value)
+    table.insert(CatchLog, 1, {
+        t = os.date("%H:%M:%S"), name = name, rarity = rarity, mut = mut, weight = weight, value = value,
+    })
+    if #CatchLog > CATCH_LOG_MAX then table.remove(CatchLog) end
+end
+
+local function exportCatchLog()
+    local lines = { "time,name,rarity,mutation,weight,value" }
+    for i = #CatchLog, 1, -1 do
+        local c = CatchLog[i]
+        lines[#lines + 1] = table.concat({ c.t, c.name, c.rarity, c.mut, c.weight, tostring(c.value) }, ",")
+    end
+    pcall(makefolder, "deepfishing")
+    local file = "deepfishing/catches_" .. os.date("%Y%m%d_%H%M%S") .. ".csv"
+    writefile(file, table.concat(lines, "\n"))
+    return file, #CatchLog
+end
+
+-- Record one catch: stats, log, alerts, webhook. Items have no price, so
+-- they count as $0 here.
+local function recordCatch(name, rarity, value)
+    value = value or 0
+    Stats.catches = Stats.catches + 1
+    Stats.byRarity[rarity] = (Stats.byRarity[rarity] or 0) + 1
+    Stats.caughtValue = Stats.caughtValue + value
+    logCatch(name, rarity, "", "", value)
+    if value > 0 and value >= Stats.bestValue then
+        Stats.bestValue = value
+        Stats.best = name .. " " .. fmtShort(value)
+    end
+    if value > 0 and value >= S.catchAlertMin then
+        local line = string.format("%s  %s  %s", name, rarity, fmtShort(value))
+        if S.catchAlerts then Lib:Notify("Nice catch", line, 5, "success") end
+        sendWebhook("Deep Fishing: caught " .. line)
+    end
+end
 Stats.lastCash = num(txt(R.cash))
 
 ---------------------------------------------------------------------------
@@ -267,8 +594,10 @@ local Cast = {
     fighting = false,
 }
 
+-- plain number parse: the label reads "28m" (metres), which num() would
+-- take as 28 million
 local function depthNow()
-    return num(txt(R.depth)) or 0
+    return tonumber((txt(R.depth) or ""):match("[%d%.]+")) or 0
 end
 
 local function rodHeld()
@@ -351,29 +680,78 @@ local MyBait = nil
 local function collectSchool()
     local out = {}
     local camPos = camera.CFrame.Position
+    -- Stay on the bait we were already following: during catch animations
+    -- the camera swings and "nearest the camera" jumped to other players'
+    -- baits. Only fall back to the camera when we have no bait yet or ours
+    -- vanished (more than 40 studs from where it was).
+    local okPrev, prev = pcall(function() return MyBait and MyBait.Position end)
+    prev = okPrev and prev or nil
     local bestBait, bestDist = nil, math.huge
     for _, c in ipairs(workspace:GetChildren()) do
         local cls = c.ClassName
         if cls == "Part" and c.Name == "Bait" then
-            local d = (c.Position - camPos).Magnitude
-            if d < bestDist then bestBait, bestDist = c, d end
+            local okP, p = pcall(function() return c.Position end)
+            if okP and p then
+                local d = prev and (p - prev).Magnitude or (p - camPos).Magnitude
+                if d < bestDist then bestBait, bestDist = c, d end
+            end
         elseif cls == "Model" then
             local name = c.Name
             local score = targetScore(name)
             if score ~= nil and not Players:FindFirstChild(name) then
-                local part = c.PrimaryPart or c:FindFirstChildWhichIsA("BasePart")
-                if part then
+                -- PrimaryPart comes back as an unreadable object in Matcha,
+                -- so use the fish's Hitbox (or its first real part)
+                local part = c:FindFirstChild("Hitbox")
+                if not part then
+                    for _, k in ipairs(c:GetChildren()) do
+                        local kc = k.ClassName
+                        if kc == "Part" or kc == "MeshPart" or kc == "UnionOperation" then part = k break end
+                    end
+                end
+                local okPos, pos = pcall(function() return part and part.Position end)
+                if part and okPos and pos then
+                    local okSize, size = pcall(function() return part.Size end)
+                    local price = Price[name]
+                    -- planner worth; items have no real price (see ITEM_PRIORITY)
+                    local worth = price
+                    if ItemNames[name] then worth = S.goForItems and ITEM_PRIORITY or nil end
+                    -- useless: junk, or a fish worth less than the minimum.
+                    -- Never a target, and the bait steers around it
+                    local useless = JunkNames[name] == true
+                        or (not ItemNames[name] and price ~= nil and price < S.minValue)
+                    -- wrappers never compare equal in Matcha, the address does
+                    local okId, id = pcall(function() return part.Address end)
                     out[#out + 1] = {
+                        id = okId and id or nil,
                         name = name,
                         part = part,
-                        score = score,
+                        score = useless and 0 or score,
+                        useless = useless,
+                        -- the game grabs when the bait is inside the hitbox,
+                        -- padded to at least 1.25 studs a side
+                        halfWidth = math.max(okSize and size and math.max(size.X, size.Z) / 2 or 1.25, 1.25),
                         rarity = ItemNames[name] and "Item" or JunkNames[name] and "Junk" or fishRarity(name),
-                        odds = Odds[name],
+                        price = price,
+                        worth = worth,
                     }
                 end
             end
         end
     end
+    if prev and bestDist > 40 then
+        -- ours is gone (new cast): pick again by distance to the camera
+        bestBait, bestDist = nil, math.huge
+        for _, c in ipairs(workspace:GetChildren()) do
+            if c.ClassName == "Part" and c.Name == "Bait" then
+                local okP, p = pcall(function() return c.Position end)
+                if okP and p and (p - camPos).Magnitude < bestDist then
+                    bestBait, bestDist = c, (p - camPos).Magnitude
+                end
+            end
+        end
+    end
+    -- between casts forget it, so the next cast starts fresh
+    if (Cast.depth or 0) <= 0 then bestBait = nil end
     MyBait = bestBait
     School = out
 end
@@ -383,19 +761,370 @@ end
 -- so point the mouse at the best fish above the bait
 ---------------------------------------------------------------------------
 
-local steerTarget = nil
+-- Same model the game uses (ThrowCinematic aim code): the pointer's X maps
+-- to a sideways offset from the landing spot,
+--     offset = pointer * tan(fov/2) * cameraDistance * aspect, capped at +-50
+-- where pointer = mouseX / width * 2 - 1, and the bait sits at
+-- landing + offset along the cast line. Working in world space means a
+-- fish's distance from the camera can't skew the aim, and the goal cursor
+-- position is computed outright instead of chased, so nothing oscillates.
+--
+-- The landing spot isn't exposed, so it's estimated each frame from where
+-- the bait actually is versus where the pointer says it should be, and
+-- smoothed (it doesn't move during a cast).
+local Steer = {
+    target = nil,   -- School entry being chased
+    lastPos = nil,  -- its last position, to find it again after a rescan
+    cursor = nil,   -- where we believe the cursor is (screen X)
+    carry = 0,      -- sub-pixel remainder of the last move
+    clock = 0,
+    landing = nil,  -- estimated sideways coordinate of the landing spot
+    manualUntil = 0,
+}
+local STEER_DEADZONE = 6
+local MAX_OFFSET = 48       -- game caps the offset at 50 studs
+local POINTER_LIMIT = 0.94  -- keep the cursor off the very edge
+local SWITCH_RATIO = 1.5    -- a new fish must be worth this much more to switch
+local BAIT_LAG = 0.1        -- the game eases the bait sideways over about this long
+-- Fish dart: logged speeds jump between -20 and +20 studs/s inside half a
+-- second, so a long lead extrapolates noise. Track the average lane until the
+-- last stretch, then follow tightly with a short lead only.
+local INTERCEPT_HORIZON = 0.8  -- seconds to arrival when tight tracking starts
+local LEAD_MAX = 0.12          -- lead covers the bait's lag, nothing more
+local FISH_SPEED_CAP = 25      -- studs/s; anything faster is a measurement spike
 
-local function pickTarget(baitY)
-    local best, bestScore = nil, 0
-    for _, f in ipairs(School) do
-        local ok, pos = pcall(function() return f.part.Position end)
-        if ok and pos and f.score > 0 and pos.Y >= baitY - 2 then
-            if f.score > bestScore then
-                best, bestScore = f, f.score
+local function entryPos(f)
+    local ok, p = pcall(function() return f.part.Position end)
+    if ok then return p end
+end
+
+---------------------------------------------------------------------------
+-- Direct steering. The game's throw controller keeps the bait's sideways
+-- offset in a field, AimOffset, and stops reading the mouse while
+-- AimLocked is true; its own auto-fish steers that way. We do the same:
+-- lock the aim and write the offset, so the bait goes exactly where we say
+-- with no cursor in between.
+--
+-- The controller's field storage moves whenever the game grows the table,
+-- so slots are re-found by a memory scan (~2s, run when a cast starts) and
+-- checked before every single write. A slot whose key no longer reads
+-- AimOffset / AimLocked is never written to.
+---------------------------------------------------------------------------
+
+local AimMem = { aim = nil, lock = nil, locating = false, lastLocate = -1e9, held = false }
+
+local function slotIs(addr, key, kind)
+    if not addr then return false end
+    local ok, t = pcall(readtbl, addr, 1)
+    local e = ok and type(t) == "table" and t[1]
+    return e ~= nil and tostring(e.key) == key and e.type == kind
+end
+
+function AimMem.valid()
+    return slotIs(AimMem.aim, "AimOffset", "number") and slotIs(AimMem.lock, "AimLocked", "boolean")
+end
+
+function AimMem.locate()
+    local now = os.clock()
+    -- the scan blocks this script for ~2s (not the game). After a failed scan
+    -- wait a while; after a good one the table may simply have moved again,
+    -- so look again right away
+    local wait = AimMem.lastFailed and 3 or 0.5
+    if AimMem.locating or now - AimMem.lastLocate < wait then return end
+    AimMem.locating, AimMem.lastLocate = true, now
+    task.spawn(function()
+        -- Matcha's scan skips anchors whose value is false or zero, and
+        -- Catchable is false at the start of a cast, so try a few fields the
+        -- throw controller always has filled in
+        local e = nil
+        for _, anchor in ipairs({ "ThrowDistance", "Catchable", "PullUpDuration", "ArcHeight" }) do
+            local ok, res = pcall(findgc, anchor, { AimOffset = "number" })
+            e = ok and type(res) == "table" and res[1] or nil
+            if e then break end
+        end
+        local aim, lock, fight = e and e.addr, nil, nil
+        if aim then
+            -- AimLocked and FightHeld live in the same node array, a few
+            -- hundred slots away
+            local okR, t = pcall(readtbl, aim - 32 * 600, 1200)
+            if okR and type(t) == "table" then
+                for _, n in ipairs(t) do
+                    local k = tostring(n.key)
+                    if k == "AimLocked" and n.type == "boolean" then lock = n.addr end
+                    if k == "FightHeld" and n.type == "number" then fight = n.addr end
+                    if lock and fight then break end
+                end
+            end
+        end
+        AimMem.aim, AimMem.lock, AimMem.fight = aim, lock, fight
+        AimMem.lastFailed = not (aim and lock)
+        AimMem.scans = (AimMem.scans or 0) + 1
+        AimMem.lastScanTime = os.clock() - now
+        AimMem.locating = false
+    end)
+end
+
+function AimMem.read()
+    local ok, v = pcall(memory_read, "double", AimMem.aim)
+    if ok and type(v) == "number" and v == v then return v end
+end
+
+-- The game counts FightHeld up only while a fish is fighting on the line,
+-- and pins the bait in place for the fight. Any change since last frame =
+-- a fight is on. Read-only; a stale slot is just ignored.
+function AimMem.fighting(now)
+    if slotIs(AimMem.fight, "FightHeld", "number") then
+        local ok, v = pcall(memory_read, "double", AimMem.fight)
+        if ok and type(v) == "number" then
+            if AimMem.lastFight and v ~= AimMem.lastFight then AimMem.fightUntil = now + 0.5 end
+            AimMem.lastFight = v
+        end
+    end
+    return now < (AimMem.fightUntil or 0)
+end
+
+-- callers check AimMem.valid() in the same frame first
+function AimMem.write(offset)
+    pcall(memory_write, "int", AimMem.lock, 1)
+    pcall(memory_write, "double", AimMem.aim, offset)
+    AimMem.held = true
+end
+
+-- hand the aim back to the mouse
+function AimMem.release()
+    if AimMem.held and AimMem.valid() then pcall(memory_write, "int", AimMem.lock, 0) end
+    AimMem.held = false
+end
+
+-- Where the bait's base is and which way AimOffset pushes it.
+--
+-- The game places the bait at base + axis * AimOffset. The base is NOT
+-- fixed: while the bait dives it slides along the cast line
+-- (DiveTo:Lerp(ArcTo, t)), which on screen is the same left-right direction
+-- the aim moves. Treating it as a fixed landing spot made every position
+-- wander by tens of studs. So the base is re-measured every frame from where
+-- the bait really is minus the offset it was given ~0.1s earlier (the bait
+-- trails the offset by about that), lightly smoothed. That is a feedback
+-- loop on the bait itself, and drift is absorbed as it happens.
+--
+-- Measured: one stud of bait per unit of offset, direction +1, in every
+-- test. (An automatic direction flip used to live here; during a fight the
+-- bait is pinned, so it read that as "steering backwards", flipped, and
+-- carried the wrong direction into every later cast.)
+--
+-- The base only moves smoothly (the dive drift), so a sample that jumps far
+-- from the estimate is a yank or a pinned bait, not drift. Those are ignored
+-- unless they persist for a third of a second.
+local AimFit = { hist = {}, slope = 1, landing = nil, oddFor = 0 }
+local AIM_TRAIL = 0.1
+local BASE_JUMP = 6
+
+function AimFit.reset()
+    AimFit.hist, AimFit.landing, AimFit.oddFor = {}, nil, 0
+end
+
+function AimFit.add(now, offset, baitLat, quiet, dt)
+    local h = AimFit.hist
+    h[#h + 1] = { t = now, v = offset }
+    while #h > 2 and h[2].t <= now - AIM_TRAIL do table.remove(h, 1) end
+    local est = baitLat - AimFit.slope * h[1].v
+    if not AimFit.landing then
+        AimFit.landing = est
+    elseif quiet then
+        dt = dt or 0.016
+        if math.abs(est - AimFit.landing) > BASE_JUMP then
+            AimFit.oddFor = AimFit.oddFor + dt
+            if AimFit.oddFor < 0.33 then return end
+        else
+            AimFit.oddFor = 0
+        end
+        -- ~0.15s smoothing: follows the dive's drift, irons out jitter
+        AimFit.landing = AimFit.landing + (est - AimFit.landing) * math.min(1, dt * 7)
+    end
+end
+
+
+-- sideways axis (camera right, flattened) and studs from screen centre to
+-- edge at the bait's distance
+local function steerGeometry(baitPos)
+    local cf = camera.CFrame
+    local r = cf.RightVector
+    local axis = Vector3.new(r.X, 0, r.Z)
+    if axis.Magnitude < 0.2 then return nil end
+    axis = axis.Unit
+    local dist = (baitPos - cf.Position):Dot(cf.LookVector)
+    if dist <= 1 then return nil end
+    local vp = camera.ViewportSize
+    local half = math.tan(math.rad(camera.FieldOfView) / 2) * dist * (vp.X / vp.Y)
+    return axis, half, vp.X
+end
+
+-- pointer (-1..1) that puts the bait at this sideways coordinate, or nil if
+-- out of reach
+local function goalPointer(lat, half)
+    if not Steer.landing then return nil end
+    local offset = lat - Steer.landing
+    if math.abs(offset) > MAX_OFFSET then return nil end
+    -- Direct mode has no cursor, only the game's +-50 cap
+    if S.steerMode == "Direct" then return offset end
+    local p = offset / half
+    if math.abs(p) > POINTER_LIMIT then return nil end
+    return p
+end
+
+-- value discounted by how far the bait still has to rise to meet the fish,
+-- so among similar fish the next one up wins; a far richer fish still does
+local GAP_FALLOFF = 25
+local function effectiveScore(f, pos, baitY)
+    return f.score / (1 + math.max(pos.Y - baitY, 0) / GAP_FALLOFF)
+end
+
+-- a fish counts once it has popped up on screen: inside the camera view and
+-- not below the bait (the same set the game shows markers for). Must run in
+-- a render callback, WorldToScreen returns nothing anywhere else
+local function onScreen(pos)
+    local scr, vis = WorldToScreen(pos)
+    if not vis then return false end
+    local vp = camera.ViewportSize
+    return scr.X >= 0 and scr.X <= vp.X and scr.Y >= 0 and scr.Y <= vp.Y
+end
+
+local function candidate(pos, baitY, axis, half)
+    return pos.Y >= baitY - 2 and goalPointer(pos:Dot(axis), half) ~= nil and onScreen(pos)
+end
+
+-- fish already on the hook ride just under the bait and would otherwise
+-- look like a perfect target forever; keyed by part address, per cast
+Steer.caught = {}
+
+local function sameFish(a, b)
+    if not (a and b) then return false end
+    if a.id and b.id then return a.id == b.id end
+    return a.name == b.name
+end
+
+-- How many more fish this cast can take, from the cast HUD's "caught/cap"
+-- counter. Rod and bait upgrades change cap, so it is read every plan.
+local function slotsLeft()
+    local a, b = (txt(R.fishAmount) or ""):match("(%d+)%s*/%s*(%d+)")
+    a, b = tonumber(a), tonumber(b)
+    if not (a and b and b > 0) then return 3, 3, 0 end
+    -- Right after a cast starts the counter can still show the last cast's
+    -- count. Until this cast has caught something, every slot is free.
+    -- (The third value stays the raw count: catch tracking diffs it.)
+    if not Steer.caughtThisCast then return b, b, a end
+    return math.max(b - a, 0), b, a
+end
+
+-- items outrank every fish here too, like in the other modes
+local RarityRank = { Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5, Mythic = 6, Secret = 7, Exotic = 8, Exclusive = 9, Item = 10 }
+
+-- what one fish adds to a route, by the chosen priority
+local function routeWorth(f)
+    local price = f.worth or 0
+    if S.targetMode == "Rarity" then
+        -- rarer always wins; price only breaks ties inside a rarity
+        return (RarityRank[f.rarity] or 0) * 1e15 + price
+    elseif S.targetMode == "Most fish" then
+        -- every fish worth keeping counts the same; price breaks ties
+        return 1e15 + price
+    end
+    return price
+end
+
+-- Plan the best set of fish for the slots left, in the order the rising bait
+-- meets them (bottom to top), and steer for the first one. Recomputed a few
+-- times a second, so the route adapts as fish swim and slots fill.
+--
+-- A route is feasible when the bait can get sideways from one fish to the
+-- next in the time it takes to rise between them. The bait follows the aim
+-- in ~0.1s, so the real limit is fish moving: ROUTE_SLACK studs of leeway.
+--
+-- Dynamic program over fish sorted by height: best[i][k] = best total worth
+-- of a route of k fish ending at fish i.
+local ROUTE_LAT_SPEED = 60 -- studs/s the bait can move sideways, conservatively
+local ROUTE_SLACK = 3
+
+local function planRoute(baitPos, axis, half)
+    local baitY, baitLat = baitPos.Y, baitPos:Dot(axis)
+    local rise = math.max(Cast.rise or 10, 2)
+    local left = slotsLeft()
+    Steer.slotsLeft = left
+    local cands = {}
+    if left > 0 then
+        for _, f in ipairs(School) do
+            if f.score > 0 and not f.useless and not Steer.caught[f.id or 0] then
+                local pos = entryPos(f)
+                if pos and pos.Y >= baitY - 1 then
+                    local lat = pos:Dot(axis)
+                    local keep = goalPointer(lat, half) ~= nil
+                    -- only fish that have shown up on screen, unless it is
+                    -- already in the route (it may swim out of view)
+                    if keep and not onScreen(pos) and not (Steer.routeIds and Steer.routeIds[f.id or 0]) then
+                        keep = false
+                    end
+                    if keep then
+                        cands[#cands + 1] = { f = f, y = pos.Y, lat = lat, worth = routeWorth(f) }
+                    end
+                end
             end
         end
     end
-    return best
+    table.sort(cands, function(p, q) return p.y < q.y end)
+
+    local n, K = #cands, math.min(left, 12)
+    local best, prevOf = {}, {}
+    local topV, topI, topK = 0, nil, 0
+    for i = 1, n do
+        best[i], prevOf[i] = {}, {}
+        local ci = cands[i]
+        -- straight from the bait
+        local reach0 = ROUTE_LAT_SPEED * math.max(ci.y - baitY, 0) / rise + ROUTE_SLACK
+        if math.abs(ci.lat - baitLat) <= reach0 then
+            best[i][1] = ci.worth
+        end
+        for j = 1, i - 1 do
+            local cj = cands[j]
+            local reach = ROUTE_LAT_SPEED * math.max(ci.y - cj.y, 0) / rise + ROUTE_SLACK
+            if math.abs(ci.lat - cj.lat) <= reach then
+                for k = 1, K - 1 do
+                    local v = best[j][k]
+                    if v and (not best[i][k + 1] or v + ci.worth > best[i][k + 1]) then
+                        best[i][k + 1] = v + ci.worth
+                        prevOf[i][k + 1] = j
+                    end
+                end
+            end
+        end
+        for k = 1, K do
+            local v = best[i][k]
+            if v and v > topV then topV, topI, topK = v, i, k end
+        end
+    end
+
+    -- walk back from the best end to recover the route, bottom first
+    local route = {}
+    local i, k = topI, topK
+    while i do
+        table.insert(route, 1, cands[i].f)
+        local j = prevOf[i][k]
+        i, k = j, k - 1
+    end
+
+    local ids = {}
+    for _, f in ipairs(route) do ids[f.id or 0] = true end
+    -- real money only: items have no price
+    local money = 0
+    for _, f in ipairs(route) do money = money + (f.price or 0) end
+    Steer.route, Steer.routeIds, Steer.routeWorth = route, ids, money
+
+    local cur = route[1]
+    if not sameFish(cur, Steer.target) then
+        -- a different fish: restart its motion tracking
+        Steer.tLat, Steer.tRaw, Steer.tVel, Steer.hookedFor = nil, nil, 0, 0
+    end
+    Steer.target = cur
+    Steer.lastPos = cur and entryPos(cur) or nil
 end
 
 ---------------------------------------------------------------------------
@@ -423,8 +1152,253 @@ targetRing.Visible = false
 Hub.drawings[#Hub.drawings + 1] = targetRing
 
 ---------------------------------------------------------------------------
+-- guards: rod equip, full inventory, staff
+---------------------------------------------------------------------------
+
+-- number key of the hotbar's rod slot (a frame named "Rod" whose number
+-- label sits inside it); falls back to 1, where the game puts the rod
+local function rodSlotKey()
+    local slot = R.hotbar and R.hotbar:FindFirstChild("Rod")
+    if slot then
+        for _, d in ipairs(slot:GetDescendants()) do
+            if d.ClassName == "TextLabel" and d.Parent and d.Parent.Name == "Number" then
+                local n = tonumber(txt(d))
+                if n and n >= 1 and n <= 9 then return n end
+            end
+        end
+    end
+    return 1
+end
+
+local function inventoryFull()
+    -- during a cast the HUD shows caught/capacity; capacity is 0 when full
+    local a = txt(R.fishAmount)
+    if a and a:match("/%s*0$") then return true end
+    local inv = (txt(R.invFish) or ""):gsub(",", "")
+    local used, cap = inv:match("(%d+)%s*/%s*(%d+)")
+    used, cap = tonumber(used), tonumber(cap)
+    return used ~= nil and cap ~= nil and cap > 0 and used >= cap
+end
+
+-- staff carry a Role attribute; it's empty for everyone else
+local function findStaff()
+    for _, p in ipairs(Players:GetPlayers()) do
+        local ok, role = pcall(function() return p:GetAttribute("Role") end)
+        if ok and type(role) == "string" and role ~= "" then
+            return tostring(p.Name) .. " (" .. role .. ")"
+        end
+    end
+end
+
+local function setAutoCast(on)
+    S.autoCast = on
+    if UI.autoCast then pcall(function() UI.autoCast:Set(on) end) end
+end
+
+---------------------------------------------------------------------------
+-- teleports
+---------------------------------------------------------------------------
+
+local function instPos(inst)
+    if not inst then return nil end
+    -- a Model has no Position: Matcha then returns nil (or a child named so)
+    local ok, p = pcall(function() return inst.Position end)
+    if ok and p ~= nil and pcall(function() return p.Magnitude end) then return p end
+    local hrp = inst:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        local okH, ph = pcall(function() return hrp.Position end)
+        if okH then return ph end
+    end
+    for _, c in ipairs(inst:GetChildren()) do
+        local kc = c.ClassName
+        if kc == "Part" or kc == "MeshPart" then
+            local okC, pc = pcall(function() return c.Position end)
+            if okC then return pc end
+        end
+    end
+end
+
+-- the world you're in: the Interactable folder whose sell NPC is nearest
+local function interactables()
+    local worlds = workspace:FindFirstChild("World")
+    if not worlds then return nil end
+    local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    local me = root and root.Position
+    local best, bestD = nil, math.huge
+    for _, w in ipairs(worlds:GetChildren()) do
+        local inter = w:FindFirstChild("Interactable")
+        local p = inter and instPos(inter:FindFirstChild("NPC_Sell"))
+        if p then
+            local d = me and (p - me).Magnitude or 0
+            if d < bestD then best, bestD = inter, d end
+        end
+    end
+    return best
+end
+
+local TeleportSpots = {
+    { label = "Sell fish", child = "NPC_Sell" },
+    { label = "Rod shop", child = "Rods" },
+    { label = "Bait shop", child = "Baits" },
+    { label = "Upgrades", child = "Upgrades" },
+    { label = "Boats", child = "NPC_Boat" },
+    { label = "World teleporter", child = "Teleport" },
+}
+
+-- one position write, landing a few studs short of the spot so you don't
+-- end up inside an NPC
+local function teleportTo(pos)
+    local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    if not (root and pos) then return false end
+    local me = root.Position
+    local flat = Vector3.new(me.X - pos.X, 0, me.Z - pos.Z)
+    local back = flat.Magnitude > 0.1 and flat.Unit * 5 or Vector3.new(0, 0, 5)
+    -- Position only. A full CFrame write with a facing direction crashed the
+    -- game on a long jump; a plain position move is the lightest write there is
+    local ok = pcall(function()
+        root.Position = pos + back + Vector3.new(0, 3, 0)
+        root.Velocity = Vector3.new(0, 0, 0)
+    end)
+    if not ok then return false end
+    return true
+end
+
+local function teleportToSpot(spot)
+    local inter = interactables()
+    local pos = inter and instPos(inter:FindFirstChild(spot.child))
+    if not pos then
+        Lib:Notify("Teleport", spot.label .. " isn't in this world", 3, "error")
+        return
+    end
+    if teleportTo(pos) then Lib:Notify("Teleport", spot.label, 2, "info") end
+end
+
+local function saveFishingSpot()
+    local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    if root then Hub.savedSpot = root.Position end
+    return Hub.savedSpot
+end
+
+---------------------------------------------------------------------------
+-- hotkeys. The menu library's own keybinds look keys up by lowercase name
+-- while storing F-keys as "F6", so F-keys never fire; these poll directly
+---------------------------------------------------------------------------
+
+local VK = {
+    None = false, Insert = 0x2D, Home = 0x24, End = 0x23, Delete = 0x2E, PageUp = 0x21, PageDown = 0x22,
+}
+for i = 1, 12 do VK["F" .. i] = 0x6F + i end
+local HotkeyNames = { "None", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    "Insert", "Home", "End", "Delete", "PageUp", "PageDown" }
+
+local function toggleSetting(handle, key, label)
+    local on = not S[key]
+    if handle then pcall(function() handle:Set(on) end) else S[key] = on end
+    Lib:Notify(label, on and "on" or "off", 1.5, on and "success" or "warning")
+end
+
+local function panic()
+    setAutoCast(false)
+    if UI.autoSteer then pcall(function() UI.autoSteer:Set(false) end) else S.autoSteer = false end
+    S.autoFight = false
+    if UI.autoFight then pcall(function() UI.autoFight:Set(false) end) end
+    Lib:Notify("Panic", "all automation off", 3, "warning")
+end
+
+local Hotkeys = {
+    { setting = "keyCast", run = function() toggleSetting(UI.autoCast, "autoCast", "Auto cast") end },
+    { setting = "keySteer", run = function() toggleSetting(UI.autoSteer, "autoSteer", "Auto steer") end },
+    { setting = "keyEsp", run = function() toggleSetting(UI.fishEsp, "fishEsp", "Fish ESP") end },
+    { setting = "keyPanic", run = panic },
+}
+
+---------------------------------------------------------------------------
 -- loops
 ---------------------------------------------------------------------------
+
+-- hotkey loop, ~30 Hz, edge-triggered; only while Roblox has focus, since
+-- iskeypressed sees keys pressed in any window
+task.spawn(function()
+    local held = {}
+    while Hub.running do
+        if focused() then
+            for _, h in ipairs(Hotkeys) do
+                local code = VK[S[h.setting]]
+                local down = code and iskeypressed(code) or false
+                if down and not held[h.setting] then
+                    local ok, err = pcall(h.run)
+                    if not ok then warn("[DeepFish] hotkey: " .. tostring(err)) end
+                end
+                held[h.setting] = down
+            end
+        end
+        task.wait(0.03)
+    end
+end)
+
+-- webhook session summary every N minutes
+task.spawn(function()
+    local last = os.clock()
+    while Hub.running do
+        task.wait(5)
+        local every = (S.summaryMins or 0) * 60
+        if every > 0 and os.clock() - last >= every then
+            last = os.clock()
+            local h = math.max((os.clock() - Stats.start) / 3600, 1 / 3600)
+            sendWebhook(string.format(
+                "Deep Fishing summary (%s): %d catches, %s caught, %s earned (%s/hr), best: %s",
+                fmtTime(os.clock() - Stats.start), Stats.catches, fmtShort(Stats.caughtValue),
+                fmtMoney(Stats.earned), fmtMoney(Stats.earned / h), Stats.best or "-"))
+        elseif every <= 0 then
+            last = os.clock()
+        end
+    end
+end)
+
+-- guard loop, 1 Hz
+task.spawn(function()
+    local lastEquip, fullWarned = 0, false
+    while Hub.running do
+        local ok, err = pcall(function()
+            local staff = findStaff()
+            if staff ~= Guard.staff then
+                Guard.staff = staff
+                if S.staffGuard then
+                    if staff then
+                        Lib:Notify("Staff in server", staff .. " - automation paused", 10, "warning")
+                        sendWebhook("Deep Fishing: staff in server, automation paused: " .. staff)
+                    else
+                        Lib:Notify("Staff left", "automation resumed", 5, "info")
+                    end
+                end
+            end
+
+            local full = inventoryFull()
+            if S.fullGuard and S.autoCast and full and not fullWarned then
+                fullWarned = true
+                setAutoCast(false)
+                Lib:Notify("Inventory full", "auto cast stopped - sell some fish", 8, "warning")
+                sendWebhook("Deep Fishing: inventory full, auto cast stopped")
+            elseif not full then
+                fullWarned = false
+            end
+
+            local now = os.clock()
+            if S.autoEquip and S.autoCast and not rodHeld() and (Cast.depth or 0) == 0
+                and not Cast.fighting and now - lastEquip > 3 and canAct() then
+                local n = rodSlotKey()
+                if n then
+                    lastEquip = now
+                    keypress(0x30 + n)
+                    task.wait(0.05)
+                    keyrelease(0x30 + n)
+                end
+            end
+        end)
+        if not ok then warn("[DeepFish] guards: " .. tostring(err)) end
+        task.wait(1)
+    end
+end)
 
 -- state loop: HUD reads, fights, auto cast
 task.spawn(function()
@@ -433,9 +1407,37 @@ task.spawn(function()
         local ok, err = pcall(function()
             local now = os.clock()
             local d = depthNow()
+            Cast.depth = d
+            -- bait rise speed from the depth readout (1 m = 1 stud), measured
+            -- over half-second windows: the label only shows whole metres
+            if d > 0 then
+                if not Cast.riseAnchor then
+                    Cast.riseAnchor = { d = d, t = now }
+                elseif now - Cast.riseAnchor.t >= 0.5 then
+                    local rate = (Cast.riseAnchor.d - d) / (now - Cast.riseAnchor.t)
+                    -- The catch window rises at ~10/s. The reel-in at the end of
+                    -- a cast shoots up much faster and used to drag this to 20+,
+                    -- which then carried into the next cast, so only plausible
+                    -- rates count
+                    if rate > 4 and rate < 18 then
+                        Cast.rise = (Cast.rise or 10) + (rate - (Cast.rise or 10)) * 0.3
+                    end
+                    Cast.riseAnchor = { d = d, t = now }
+                end
+            else
+                Cast.riseAnchor = nil
+                Cast.rise = 10
+            end
             local th = txt(R.throwDist)
             if d > 0 or th ~= Cast.lastThrowText then
                 Cast.lastActive = now
+            end
+            -- a throw has started (the distance counter is moving, the bait
+            -- isn't in the water yet): find the aim fields now, during the
+            -- ~2s flight, so steering is ready at the splash
+            if d == 0 and th ~= Cast.lastThrowText and S.autoSteer and S.steerMode == "Direct"
+                and not AimMem.valid() then
+                AimMem.locate()
             end
             Cast.lastThrowText = th
 
@@ -462,8 +1464,24 @@ task.spawn(function()
     local quietEvents = { Day = true, Night = true, Rain = true }
     while Hub.running do
         local ok, err = pcall(function()
-            if S.autoSteer or S.fishEsp then collectSchool() else School = {} end
-            scanCatches(true)
+            if S.autoSteer or S.fishEsp or S.spawnAlert then collectSchool() else School = {} end
+
+            -- something valuable turned up in this cast's school
+            if (Cast.depth or 0) > 0 then
+                if S.spawnAlert then
+                    for _, f in ipairs(School) do
+                        local key = f.id or f.name
+                        if (f.price or 0) >= S.spawnAlertMin and not Hub.spawnSeen[key] then
+                            Hub.spawnSeen[key] = true
+                            local line = string.format("%s (%s, %s) is in your school", f.name, f.rarity or "?", fmtShort(f.price))
+                            Lib:Notify("Rare fish!", line, 6, "success")
+                            sendWebhook("Deep Fishing: " .. line)
+                        end
+                    end
+                end
+            elseif next(Hub.spawnSeen) then
+                Hub.spawnSeen = {}
+            end
 
             local cash = num(txt(R.cash))
             if cash and Stats.lastCash then
@@ -507,41 +1525,320 @@ task.spawn(function()
     end
 end)
 
--- renderer: steering and ESP, reads only
-Hub.conns[#Hub.conns + 1] = RunService.RenderStepped:Connect(function()
-    if not Hub.running then return end
-    local bait = MyBait
-    local baitPos = nil
-    if bait then
-        local ok, p = pcall(function() return bait.Position end)
-        if ok then baitPos = p end
+-- Catches, counted off the cast HUD's caught/cap counter (the game no
+-- longer pops a notification per catch). The fish riding just under the
+-- bait when the counter ticks is the one that was caught.
+Steer.logged = {}
+local function trackCatches(baitPos)
+    local _, _, caughtNow = slotsLeft()
+    local prev = Steer.caughtCount
+    Steer.caughtCount = caughtNow
+    if not prev or caughtNow <= prev then return end
+    Steer.lastHookAt = os.clock()
+    Steer.caughtThisCast = true
+    for _ = 1, caughtNow - prev do
+        local best, bestD = nil, 6
+        if baitPos then
+            for _, f in ipairs(School) do
+                if not Steer.logged[f.id or 0] then
+                    local pos = entryPos(f)
+                    local d = pos and (pos - baitPos).Magnitude
+                    if d and d < bestD then best, bestD = f, d end
+                end
+            end
+        end
+        if best then Steer.logged[best.id or 0] = true end
+        recordCatch(best and best.name or "Fish", best and best.rarity or "?", best and best.price or 0)
     end
-    local casting = baitPos ~= nil and depthNow() > 0
+end
 
-    -- steering
-    steerTarget = nil
-    if S.autoSteer and casting and not Cast.fighting and canAct() then
-        local t = pickTarget(baitPos.Y)
-        if t then
-            local ok, pos = pcall(function() return t.part.Position end)
-            if ok and pos then
-                local scr, vis = WorldToScreen(pos)
-                if vis then
-                    steerTarget = { x = scr.X, y = scr.Y }
-                    local dx = scr.X - mouse.X
-                    if math.abs(dx) > 3 then
-                        pcall(mousemoverel, math.floor(dx * S.steerSmooth + 0.5), 0)
+-- renderer: steering and ESP
+local function renderStep(dt)
+    dt = math.min(dt or 0.016, 0.05)
+    local casting = (Cast.depth or 0) > 0
+    local baitPos = nil
+    if casting and MyBait then
+        local ok, p = pcall(function() return MyBait.Position end)
+        if ok and p then baitPos = p end
+    end
+
+    if baitPos then trackCatches(baitPos) end
+
+    local axis, half, width
+    if S.autoSteer and baitPos then
+        axis, half, width = steerGeometry(baitPos)
+    end
+
+    local direct = S.steerMode == "Direct"
+    local aimLive = false
+    if direct and axis then
+        -- aim slots: found by a background scan when a cast starts, checked
+        -- every frame before anything touches them
+        aimLive = AimMem.valid()
+        if not aimLive then AimMem.locate() end
+    end
+    -- a fish fighting on the line pins the bait: no steering, no learning
+    local fightNow = Cast.fighting or (aimLive and AimMem.fighting(os.clock())) or false
+
+    -- landing spot estimate. Direct: fitted from the offset we read back
+    -- against where the bait really is. Mouse modes: bait position minus
+    -- the offset the current pointer asks for.
+    if axis and direct then
+        local offset = aimLive and AimMem.read()
+        if offset then
+            -- A catch yanks the bait about: the caught counter going up, a
+            -- fish riding under it, or a fight. Don't learn from those moments
+            local quiet = not fightNow and (Steer.hookedFor or 0) == 0
+                and os.clock() - (Steer.lastHookAt or -1e9) > 0.6
+            AimFit.add(os.clock(), offset, baitPos:Dot(axis), quiet, dt)
+            Steer.landing = AimFit.landing
+        end
+    elseif axis then
+        local pointer = math.clamp(mouse.X / width * 2 - 1, -1, 1)
+        local sample = baitPos:Dot(axis) - pointer * half
+        if Steer.landing then
+            Steer.landing = Steer.landing + (sample - Steer.landing) * math.min(1, dt * 2)
+        else
+            Steer.landing = sample
+        end
+    end
+    if axis and Steer.landing then
+        Steer.clock = Steer.clock + dt
+        if Steer.clock >= 0.15 then
+            Steer.clock = 0
+            planRoute(baitPos, axis, half)
+        end
+    elseif not axis then
+        Steer.target, Steer.lastPos, Steer.landing = nil, nil, nil
+        Steer.route, Steer.routeIds, Steer.routeWorth = nil, nil, 0
+        if not casting then
+            Steer.caughtCount, Steer.caughtThisCast = nil, nil
+            if next(Steer.logged) then Steer.logged = {} end
+            if next(Steer.caught) then Steer.caught = {} end
+            if AimFit.landing then AimFit.reset() end
+        end
+    end
+
+    -- where the bait should be sideways (studs along the axis), or nil
+    local goalLat = nil
+    local target = Steer.target
+    local targetPos = target and entryPos(target)
+    if axis and targetPos then
+        local raw = targetPos:Dot(axis)
+        local gap = targetPos.Y - baitPos.Y
+        if Steer.tRaw then
+            local v = math.clamp((raw - Steer.tRaw) / dt, -FISH_SPEED_CAP, FISH_SPEED_CAP)
+            Steer.tVel = (Steer.tVel or 0) + (v - (Steer.tVel or 0)) * math.min(1, dt * 4)
+        end
+        Steer.tRaw = raw
+        Steer.tLat = Steer.tLat and (Steer.tLat + (raw - Steer.tLat) * math.min(1, dt * 3)) or raw
+        -- time until the rising bait reaches the fish's height, plus ~0.1s
+        -- for the game's own smoothing of the bait's sideways move
+        local eta = math.max(gap, 0) / math.max(Cast.rise or 10, 2) + BAIT_LAG
+        Steer.targetGap = gap
+        -- hooked: it sits 1-2 studs under the bait, in the same lane, and
+        -- stays there. Mark it and move on to the next fish
+        if gap < -0.4 and gap > -2.6 and math.abs(raw - baitPos:Dot(axis)) < 2 then
+            Steer.hookedFor = (Steer.hookedFor or 0) + dt
+            if Steer.hookedFor > 0.4 and target.id then
+                Steer.caught[target.id] = true
+                Steer.target, Steer.lastPos, Steer.clock = nil, nil, 1
+            end
+        else
+            Steer.hookedFor = 0
+        end
+        if eta > INTERCEPT_HORIZON then
+            -- still a way off: sit in its average lane, don't chase each dart
+            goalLat = Steer.tLat
+        else
+            -- Final approach: sit on the fish, leading it only by the bait's own
+            -- ~0.1s lag. Leading further meant extrapolating the fish's average
+            -- speed, and fish turn often enough that it pointed the wrong way.
+            -- The game grabs anything the bait overlaps for the ~quarter
+            -- second it takes to rise through a hitbox, so being on it now wins
+            goalLat = raw + (Steer.tVel or 0) * math.min(eta, LEAD_MAX)
+        end
+    elseif axis and S.avoidJunk then
+        -- Nothing worth chasing: go back to the middle of the lane and dodge
+        -- from there. Holding wherever the bait happened to be fed on itself
+        -- (a dodge pushed it out, the hold kept it out, the next dodge pushed
+        -- further) until the offset pinned at the cap.
+        goalLat = Steer.landing or baitPos:Dot(axis)
+    end
+
+    -- Dodge fish the bait mustn't take. With a target, only ones the bait
+    -- reaches before it: junk above the target can't cost it. Direct control
+    -- answers in ~0.1s, so the look-ahead is 0.8s; through the mouse it has
+    -- to start much earlier.
+    if goalLat then
+        local hazards = {}
+        local rise = math.max(Cast.rise or 10, 2)
+        local window = direct and rise * 0.8 or 10
+        local limit = targetPos and math.min(window, (Steer.targetGap or window) - 1) or window
+        local pad = 1.5
+        for _, f in ipairs(School) do
+            -- junk always (when avoiding it); any other fish too when the
+            -- route already needs every slot left, since it would steal one
+            local routeFull = Steer.route and #Steer.route > 0 and #Steer.route >= (Steer.slotsLeft or 99)
+            local inRoute = Steer.routeIds and Steer.routeIds[f.id or 0]
+            local obstacle = (S.avoidJunk and f.useless) or (routeFull and not inRoute)
+            if obstacle and not Steer.caught[f.id or 0] then
+                local pos = entryPos(f)
+                if pos then
+                    -- still above the bait only: one riding just below is
+                    -- already hooked and dodging it does nothing
+                    local gap = pos.Y - baitPos.Y
+                    if gap > -0.5 and gap < limit then
+                        hazards[#hazards + 1] = { lat = pos:Dot(axis), r = f.halfWidth + pad, gap = gap }
                     end
+                end
+            end
+        end
+        -- step to whichever side of each obstacle keeps the bait closest to
+        -- where it wanted to be
+        local want = goalLat
+        for _ = 1, 4 do
+            local moved = false
+            for _, h in ipairs(hazards) do
+                if math.abs(goalLat - h.lat) < h.r then
+                    local side = (want >= h.lat) and 1 or -1
+                    goalLat = h.lat + side * h.r
+                    moved = true
+                end
+            end
+            if not moved then break end
+        end
+        -- The bait grabs whatever it touches on the way, not just where it
+        -- stops. Junk the bait reaches in the next third of a second is a
+        -- wall: don't slide across its lane until the bait has risen past it.
+        local baitLat = baitPos:Dot(axis)
+        for _, h in ipairs(hazards) do
+            if h.gap < rise * 0.35 then
+                local lo, hi = h.lat - h.r, h.lat + h.r
+                if baitLat <= lo and goalLat > lo then
+                    goalLat = lo
+                elseif baitLat >= hi and goalLat < hi then
+                    goalLat = hi
                 end
             end
         end
     end
 
-    if steerTarget and S.fishEsp then
-        targetRing.Position = Vector2.new(steerTarget.x, steerTarget.y)
-        targetRing.Visible = true
-    else
-        targetRing.Visible = false
+    -- a lead can overshoot past where the bait can go; hold it at the edge
+    -- of reach instead of giving up on the fish
+    if goalLat and Steer.landing and half then
+        local lim = direct and MAX_OFFSET or math.min(MAX_OFFSET, POINTER_LIMIT * half)
+        goalLat = math.clamp(goalLat, Steer.landing - lim, Steer.landing + lim)
+    end
+
+    -- Direct: write the offset that puts the bait at goalLat. Needs no
+    -- focus or closed menu (no input is sent), only the staff guard applies.
+    -- During a fight the game holds the aim itself, so leave it alone.
+    if direct then
+        local paused = S.staffGuard and Guard.staff
+        if goalLat and Steer.landing and aimLive and not fightNow and not paused then
+            Steer.dbgGoal = goalLat
+            local offset = math.clamp((goalLat - Steer.landing) / AimFit.slope, -MAX_OFFSET, MAX_OFFSET)
+            AimMem.write(offset)
+            if S.fishEsp and targetPos then
+                local scr, vis = WorldToScreen(targetPos)
+                targetRing.Visible = vis == true
+                if vis then targetRing.Position = Vector2.new(scr.X, scr.Y) end
+            else
+                targetRing.Visible = false
+            end
+        else
+            if not fightNow then AimMem.release() end
+            targetRing.Visible = false
+        end
+    end
+
+    -- mouse modes: move the cursor to the pointer that puts the bait at goalLat
+    local steering = false
+    local now = os.clock()
+    local p = (not direct) and goalLat and goalPointer(goalLat, half)
+    if p and not Cast.fighting and now >= Steer.manualUntil and canAct() then
+        steering = true
+        local goalX = (p + 1) / 2 * width
+        if S.fishEsp and targetPos then
+            local scr, vis = WorldToScreen(targetPos)
+            targetRing.Visible = vis == true
+            if vis then targetRing.Position = Vector2.new(scr.X, scr.Y) end
+        end
+        local mx = mouse.X
+        if S.steerMode == "Instant" then
+            -- Teleport with an absolute move. Relative moves get scaled by
+            -- Windows pointer acceleration, so big jumps landed in the wrong
+            -- place. Absolute coordinates may be offset from the game's
+            -- viewport (window border, top bar), so the offset is learned from
+            -- where the cursor actually lands.
+            --
+            -- Moves go out every frame the goal shifts. The offset is only
+            -- re-learned when the goal has held still for 0.1s, since a
+            -- reading taken mid-stream would compare against a stale move.
+            local pend = Steer.pending
+            if pend and now - pend.t >= 0.1 then
+                Steer.offX = pend.sx - mx
+                Steer.offY = pend.sy - mouse.Y
+                Steer.pending = nil
+                Steer.calibratedAt = now
+            end
+            -- the cursor sits away from where we put it with nothing in
+            -- flight: the player has the mouse
+            if Steer.offX and not Steer.pending and Steer.sentX
+                and now - (Steer.sentAt or 0) > 0.15 and math.abs(mx - Steer.sentX) > 40 then
+                Steer.manualUntil = now + 1.5
+                Steer.sentX = nil
+                targetRing.Visible = false
+                return
+            end
+            if not Steer.sentX or math.abs(goalX - Steer.sentX) > 2 then
+                local sx = goalX + (Steer.offX or 0)
+                local sy = mouse.Y + (Steer.offY or 0)
+                pcall(mousemoveabs, math.floor(sx + 0.5), math.floor(sy + 0.5))
+                Steer.sentX, Steer.sentAt = goalX, now
+                -- a newer move makes any pending calibration stale
+                if not Steer.offX or now - (Steer.calibratedAt or 0) > 2 then
+                    Steer.pending = { sx = sx, sy = sy, t = now }
+                else
+                    Steer.pending = nil
+                end
+            end
+        else
+            -- Smooth: eased relative moves, with our own idea of where the
+            -- cursor is (mouse.X lags a frame behind what we send)
+            if not Steer.cursor then Steer.cursor = mx end
+            if math.abs(mx - Steer.cursor) > math.max(80, math.abs(Steer.lastMove or 0) * 3) then
+                Steer.manualUntil = now + 1.5
+                Steer.cursor, Steer.carry = nil, 0
+                targetRing.Visible = false
+                return
+            end
+            -- slow pull toward the real cursor corrects pointer acceleration
+            Steer.cursor = Steer.cursor + (mx - Steer.cursor) * math.min(1, dt * 3)
+            Steer.cursor = math.clamp(Steer.cursor, 0, width)
+            local err = goalX - Steer.cursor
+            local move = 0
+            if math.abs(err) > STEER_DEADZONE then
+                local speed = math.clamp(S.steerSpeed, 1, 10)
+                local step = err * (1 - math.exp(-dt * speed * 2))
+                local cap = 450 * speed * dt
+                step = math.clamp(step, -cap, cap) + Steer.carry
+                move = step >= 0 and math.floor(step) or math.ceil(step)
+                Steer.carry = step - move
+            else
+                Steer.carry = 0
+            end
+            Steer.lastMove = move
+            if move ~= 0 then
+                pcall(mousemoverel, move, 0)
+                Steer.cursor = Steer.cursor + move
+            end
+        end
+    end
+    if not steering then
+        Steer.cursor, Steer.carry, Steer.pending, Steer.sentX = nil, 0, nil, nil
+        if not direct then targetRing.Visible = false end
     end
 
     -- ESP
@@ -557,7 +1854,7 @@ Hub.conns[#Hub.conns + 1] = RunService.RenderStepped:Connect(function()
                         n = n + 1
                         local e = espPool[n]
                         local label = f.name
-                        if f.odds then label = label .. "  1/" .. tostring(f.odds) end
+                        if f.price then label = label .. "  " .. fmtShort(f.price) end
                         e.Text = label
                         e.Position = Vector2.new(scr.X, scr.Y - 22)
                         e.Color = f.rarity == "Item" and ItemColor or RarityColor[f.rarity] or RarityColor.Common
@@ -568,6 +1865,25 @@ Hub.conns[#Hub.conns + 1] = RunService.RenderStepped:Connect(function()
         end
     end
     for i = n + 1, POOL do espPool[i].Visible = false end
+end
+
+-- errors in here would otherwise kill steering silently; log them, at most
+-- once every 5 seconds
+local lastRenderError = 0
+Hub.conns[#Hub.conns + 1] = RunService.RenderStepped:Connect(function(dt)
+    if not Hub.running then return end
+    -- Not the current copy any more (replaced by a newer load): stop
+    -- everything. keepMenu, because the menu on screen belongs to the newer
+    -- copy and must not be torn down by this one.
+    if _G.DeepFishHub ~= Hub then
+        pcall(Hub.Unload, true)
+        return
+    end
+    local ok, err = pcall(renderStep, dt)
+    if not ok and os.clock() - lastRenderError > 5 then
+        lastRenderError = os.clock()
+        warn("[DeepFish] render: " .. tostring(err))
+    end
 end)
 
 ---------------------------------------------------------------------------
@@ -589,10 +1905,48 @@ Lib:Category("FISHING")
 local tFish = win:Tab("Fishing", "target")
 
 local sCast = tFish:Section("Auto cast", "Left", "casts for you when idle")
-sCast:Toggle("Auto cast", S.autoCast, function(on)
+
+-- The menu library calls widget callbacks straight from its own frame loop,
+-- so one error in a callback kills the loop: the menu freezes on screen and,
+-- since it was holding game input back, the game stops responding. (A bad
+-- teleport did exactly that.) Every callback the script registers goes
+-- through safe() instead, patched in once on the shared section class.
+local function safe(fn)
+    return function(...)
+        local ok, err = pcall(fn, ...)
+        if not ok then
+            warn("[DeepFish] menu action failed: " .. tostring(err))
+            pcall(function() Lib:Notify("Error", tostring(err), 5, "error") end)
+        end
+    end
+end
+
+do
+    local mt = getmetatable(sCast)
+    local cls = mt and mt.__index
+    if type(cls) == "table" and not rawget(cls, "__deepfishSafe") then
+        cls.__deepfishSafe = true
+        -- position of the callback among each method's arguments (after self)
+        for name, at in pairs({ Toggle = 3, Button = 2, Slider = 7, Dropdown = 5, Textbox = 3, Keybind = 3 }) do
+            local orig = cls[name]
+            if type(orig) == "function" then
+                cls[name] = function(self, ...)
+                    local args = table.pack(...)
+                    if type(args[at]) == "function" then args[at] = safe(args[at]) end
+                    return orig(self, table.unpack(args, 1, args.n))
+                end
+            end
+        end
+    end
+end
+UI.autoCast = sCast:Toggle("Auto cast", S.autoCast, function(on)
     S.autoCast = on
-    if on then Lib:Notify("Auto cast", "on - close the menu (P) so clicks reach the game", 4, "success") end
-end):AddKeybind("f6", "Toggle")
+    if on then
+        saveFishingSpot()
+        Lib:Notify("Auto cast", "on - close the menu (P) so clicks reach the game", 4, "success")
+    end
+end)
+sCast:Toggle("Auto equip rod", S.autoEquip, function(on) S.autoEquip = on end, "presses the rod's hotbar key if auto cast finds your hands empty")
 sCast:Dropdown("Throw quality", { S.throwQuality }, { "Perfect", "Good" }, false, function(v)
     S.throwQuality = (type(v) == "table" and v[1]) or v or "Perfect"
 end)
@@ -601,22 +1955,42 @@ sCast:Slider("Cooldown", S.castCooldown, 0.1, 0.5, 5, "s", function(v) S.castCoo
 sCast:Label(function() return string.format("Hold time: %d ms  (%d steps)", math.floor(holdTime() * 1000), R.hookSteps) end)
 
 local sFight = tFish:Section("Catch fight", "Left")
-sFight:Toggle("Auto fight", S.autoFight, function(on) S.autoFight = on end, "clicks for you while a fish fights back")
+UI.autoFight = sFight:Toggle("Auto fight", S.autoFight, function(on) S.autoFight = on end, "clicks for you while a fish fights back")
 sFight:Slider("Click rate", S.clickRate, 1, 4, 12, "/s", function(v) S.clickRate = v end, "the game caps credit at 12/s")
 sFight:Label(function() return "Fighting: " .. (Cast.fighting and "yes" or "no") end)
 
-local sSteer = tFish:Section("Steering", "Right", "aims the bait at the rarest fish")
-sSteer:Toggle("Auto steer", S.autoSteer, function(on) S.autoSteer = on end)
-sSteer:Toggle("Chase items", S.steerItems, function(on) S.steerItems = on end, "enchant stones, baits, chests, keys")
-sSteer:Toggle("Avoid junk", S.avoidJunk, function(on) S.avoidJunk = on end)
-sSteer:Slider("Smoothness", S.steerSmooth, 0.05, 0.1, 1, "", function(v) S.steerSmooth = v end)
+local sSteer = tFish:Section("Steering", "Right", "aims the bait at the most valuable fish on screen")
+UI.autoSteer = sSteer:Toggle("Auto steer", S.autoSteer, function(on) S.autoSteer = on end)
+sSteer:Toggle("Go for items", S.goForItems, function(on) S.goForItems = on end, "enchant stones, scrolls, chests, keys, baits, potions")
+sSteer:Toggle("Avoid useless", S.avoidJunk, function(on) S.avoidJunk = on end, "steer around junk and fish under the minimum value")
+sSteer:Dropdown("Min value", { fmtShort(S.minValue) }, { "$0", "$50", "$100", "$500", "$1K", "$10K", "$100K" }, false, function(v)
+    v = (type(v) == "table" and v[1]) or v
+    local n = num(tostring(v or ""):gsub("%$", ""))
+    if n then S.minValue = n end
+end, "fish worth less than this are never chased and get dodged")
+sSteer:Dropdown("Steer mode", { S.steerMode }, { "Direct", "Instant", "Smooth" }, false, function(v)
+    local mode = (type(v) == "table" and v[1]) or v or "Direct"
+    if mode ~= "Direct" then AimMem.release() end
+    S.steerMode = mode
+end, "Direct moves the bait itself and leaves your mouse alone; Instant and Smooth drive the cursor")
+sSteer:Slider("Smooth speed", S.steerSpeed, 0.5, 1, 10, "", function(v) S.steerSpeed = v end, "only for Smooth: lower is smoother, higher reacts faster")
+sSteer:Dropdown("Go for", { S.targetMode }, { "Value", "Rarity", "Most fish" }, false, function(v)
+    S.targetMode = (type(v) == "table" and v[1]) or v or "Value"
+end, "Value: most money per cast. Rarity: rarest first. Most fish: fill every slot")
 sSteer:Label(function()
-    local t = pickTarget(-1e9)
-    return "Best in school: " .. (t and t.name or "-")
+    local r = Steer.route
+    if not (r and #r > 0) then return "Route: -" end
+    local names = {}
+    for i, f in ipairs(r) do if i <= 3 then names[#names + 1] = f.name end end
+    return "Route: " .. table.concat(names, " > ") .. (#r > 3 and " ..." or "")
+end)
+sSteer:Label(function()
+    return string.format("Slots left: %s   Route worth: %s", tostring(Steer.slotsLeft or "?"),
+        fmtShort(Steer.routeWorth or 0))
 end)
 
 local sEsp = tFish:Section("Fish ESP", "Right")
-sEsp:Toggle("Show fish", S.fishEsp, function(on) S.fishEsp = on end, "name and odds over the school while you cast")
+UI.fishEsp = sEsp:Toggle("Show fish", S.fishEsp, function(on) S.fishEsp = on end, "name and value over the school while you cast")
 sEsp:Toggle("Show junk", S.espJunk, function(on) S.espJunk = on end)
 
 Lib:Category("INFO")
@@ -631,12 +2005,30 @@ sStats:Label(function()
     local h = math.max((os.clock() - Stats.start) / 3600, 1 / 3600)
     return string.format("Per hour: %s   %d fish", fmtMoney(Stats.earned / h), math.floor(Stats.catches / h))
 end)
+sStats:Label(function() return "Value caught: " .. fmtShort(Stats.caughtValue) end)
 sStats:Label(function() return "Best: " .. (Stats.best or "-") end)
 sStats:Button("Reset session", function()
     Stats.start = os.clock()
     Stats.casts, Stats.catches, Stats.fights, Stats.fightsWon, Stats.earned, Stats.spent = 0, 0, 0, 0, 0, 0
-    Stats.byRarity, Stats.best, Stats.bestOdds = {}, nil, 0
+    Stats.byRarity, Stats.best, Stats.bestValue, Stats.caughtValue = {}, nil, 0, 0
 end)
+
+local sLog = tInfo:Section("Recent catches", "Left")
+for i = 1, 8 do
+    sLog:Label(function()
+        local c = CatchLog[i]
+        if not c then return i == 1 and "nothing yet" or " " end
+        return string.format("%s  %s  %s", c.t, c.name, fmtShort(c.value))
+    end)
+end
+sLog:Button("Export log", function()
+    local ok, file, n = pcall(exportCatchLog)
+    if ok then
+        Lib:Notify("Catch log", n .. " catches saved to " .. file, 5, "success")
+    else
+        Lib:Notify("Catch log", "export failed: " .. tostring(file), 5, "error")
+    end
+end, "writes a CSV to the Matcha workspace folder")
 
 local sRar = tInfo:Section("By rarity", "Right")
 for _, r in ipairs({ "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Secret", "Exotic" }) do
@@ -647,10 +2039,83 @@ local sAlerts = tInfo:Section("Alerts", "Right")
 sAlerts:Toggle("Event alerts", S.eventAlerts, function(on) S.eventAlerts = on end)
 sAlerts:Toggle("Rare events only", S.rareEventsOnly, function(on) S.rareEventsOnly = on end, "skip day, night and rain")
 sAlerts:Toggle("Rare catch alerts", S.catchAlerts, function(on) S.catchAlerts = on end)
-sAlerts:Slider("Alert at odds", S.catchAlertMin, 50, 50, 20000, "", function(v) S.catchAlertMin = v end, "1 in N or rarer")
+sAlerts:Dropdown("Alert at value", { fmtShort(S.catchAlertMin) }, { "$1K", "$10K", "$100K", "$1M", "$10M", "$100M", "$1B" }, false, function(v)
+    v = (type(v) == "table" and v[1]) or v
+    local n = num(tostring(v or ""):gsub("%$", ""))
+    if n then S.catchAlertMin = n end
+end, "notify when a catch sells for this much or more")
+
+sAlerts:Toggle("Rare fish spawn alert", S.spawnAlert, function(on) S.spawnAlert = on end, "tells you when a valuable fish shows up in your school, before you catch it")
+sAlerts:Dropdown("Spawn alert at", { fmtShort(S.spawnAlertMin) }, { "$10K", "$100K", "$1M", "$10M", "$100M", "$1B" }, false, function(v)
+    v = (type(v) == "table" and v[1]) or v
+    local n = num(tostring(v or ""):gsub("%$", ""))
+    if n then S.spawnAlertMin = n end
+end)
+
+local sHook = tInfo:Section("Discord webhook", "Right", "pings you for big catches")
+sHook:Toggle("Enabled", S.webhook, function(on) S.webhook = on end, "uses the same value threshold as catch alerts")
+sHook:Dropdown("Summary every", { S.summaryMins > 0 and (S.summaryMins .. " min") or "Off" }, { "Off", "15 min", "30 min", "60 min" }, false, function(v)
+    v = (type(v) == "table" and v[1]) or v
+    S.summaryMins = tonumber(tostring(v or ""):match("%d+")) or 0
+end, "posts session totals on a timer")
+sHook:Textbox("Webhook URL", S.webhookUrl, function(text)
+    S.webhookUrl = tostring(text or ""):gsub("%s", "")
+    if S.webhookUrl ~= "" and not validWebhook(S.webhookUrl) then
+        Lib:Notify("Webhook", "that isn't a discord.com webhook URL", 4, "error")
+    end
+end)
+sHook:Button("Send test", function()
+    if not validWebhook(S.webhookUrl) then
+        Lib:Notify("Webhook", "paste a discord.com webhook URL first", 4, "error")
+    elseif not S.webhook then
+        Lib:Notify("Webhook", "turn it on first", 3, "warning")
+    else
+        sendWebhook("Deep Fishing: webhook test")
+        Lib:Notify("Webhook", "test sent", 3, "success")
+    end
+end)
+
+Lib:Category("WORLD")
+local tTp = win:Tab("Teleport", "location-pin")
+local sTp = tTp:Section("Places", "Left", "experimental - one jump, in the world you're in")
+for _, spot in ipairs(TeleportSpots) do
+    sTp:Button(spot.label, function() teleportToSpot(spot) end)
+end
+local sSpot = tTp:Section("Fishing spot", "Right", "saved automatically when you turn auto cast on")
+sSpot:Button("Save spot here", function()
+    if saveFishingSpot() then Lib:Notify("Fishing spot", "saved", 2, "success") end
+end)
+sSpot:Button("Back to fishing spot", function()
+    if not Hub.savedSpot then
+        Lib:Notify("Fishing spot", "save a spot first", 3, "warning")
+    elseif teleportTo(Hub.savedSpot) then
+        Lib:Notify("Teleport", "fishing spot", 2, "info")
+    end
+end)
+sSpot:Label(function()
+    local p = Hub.savedSpot
+    return p and string.format("Saved: %.0f, %.0f, %.0f", p.X, p.Y, p.Z) or "Saved: none"
+end)
+sSpot:Info("Teleporting moves your character instantly. Other players can see it, so use it sparingly.")
 
 Lib:Category("SYSTEM")
 local tMisc = win:Tab("Misc", "three-dots-horizontal")
+
+local sKeys = tMisc:Section("Hotkeys", "Left", "work while the menu is closed")
+for _, def in ipairs({
+    { "Auto cast", "keyCast" }, { "Auto steer", "keySteer" }, { "Fish ESP", "keyEsp" }, { "Panic (all off)", "keyPanic" },
+}) do
+    local label, key = def[1], def[2]
+    sKeys:Dropdown(label, { S[key] }, HotkeyNames, false, function(v)
+        S[key] = (type(v) == "table" and v[1]) or v or "None"
+    end)
+end
+local sSafety = tMisc:Section("Safety", "Right")
+sSafety:Toggle("Pause for staff", S.staffGuard, function(on) S.staffGuard = on end, "stops all automation while a player with a staff role is in the server")
+sSafety:Label(function() return "Staff: " .. (Guard.staff or "none") end)
+sSafety:Toggle("Stop when full", S.fullGuard, function(on) S.fullGuard = on end, "turns auto cast off when your fish inventory is full")
+sSafety:Label(function() return "Fish bag: " .. (txt(R.invFish) or "?") end)
+
 local sMisc = tMisc:Section("Misc", "Left")
 sMisc:Toggle("Anti AFK", S.antiAfk, function(on) S.antiAfk = on end)
 sMisc:Button("Rescan game", function()
@@ -659,31 +2124,65 @@ sMisc:Button("Rescan game", function()
     local n = 0 for _ in pairs(Odds) do n = n + 1 end
     Lib:Notify("Rescan", n .. " fish in database", 3, "info")
 end)
+sMisc:Button("Refresh prices", function()
+    Lib:Notify("Prices", "scanning memory, the game may freeze for a few seconds", 4, "warning")
+    task.spawn(function()
+        local ok, n = pcall(refreshPrices)
+        if ok then
+            Lib:Notify("Prices", n .. " items priced and saved", 4, "success")
+        else
+            Lib:Notify("Prices", "scan failed: " .. tostring(n), 5, "error")
+        end
+    end)
+end, "only needed after a game update adds new fish")
 sMisc:Label(function()
-    local n = 0 for _ in pairs(Odds) do n = n + 1 end
-    return "Fish known: " .. n
+    local n = 0 for _ in pairs(Price) do n = n + 1 end
+    return "Fish priced: " .. n
 end)
 sMisc:Button("Unload", function()
     Lib:Dialog({
         title = "Unload?",
         text = "Stop everything and remove the menu?",
         confirm = "Unload",
-        onConfirm = function() Hub.Unload() end,
+        onConfirm = safe(function() Hub.Unload() end),
     })
 end):SetRisk()
 
 win:AddSettingsTab("gear")
 
--- box lines only render plain values, so a loop rewrites line.Value
+-- Box lines only render plain values, so a loop rewrites line.Value.
+-- A Stat line splits at its first colon into a label and a right-aligned
+-- value, so each one holds exactly one "Label: value" pair.
 local box = Lib:CreateBox({ title = "Deep Fishing", position = Vector2.new(20, 160), width = 210 })
+local function onOff(v) return v and "ON" or "off" end
 local boxLines = {
-    { line = box:Text(""), get = function() return "Auto: " .. (S.autoCast and "ON" or "off") .. (menuOpen() and "  (menu open)" or "") end },
-    { line = box:Stat(""), get = function() return string.format("Casts: %d   Catches: %d", Stats.casts, Stats.catches) end },
+    -- an empty Stat line is skipped, so this row only shows with a warning
+    { line = box:Stat(""), get = function()
+        if S.staffGuard and Guard.staff then return "PAUSED - staff in server" end
+        if S.autoCast and menuOpen() then return "Close the menu so auto cast can click" end
+        return ""
+    end },
+    { line = box:Stat(""), get = function() return "Auto cast: " .. onOff(S.autoCast) end },
+    { line = box:Stat(""), get = function() return "Auto steer: " .. onOff(S.autoSteer) end },
+    { line = box:Stat(""), get = function()
+        local r = Steer.route
+        if not (r and #r > 0) then return "Route: -" end
+        local money = 0
+        for _, f in ipairs(r) do money = money + (f.price or 0) end
+        return string.format("Route: %d fish, %s", #r, fmtShort(money))
+    end },
+    { line = box:Stat(""), get = function()
+        local t = Steer.target
+        return "Next: " .. (t and t.name or "-")
+    end },
+    { line = box:Stat(""), get = function() return "Bag: " .. (txt(R.invFish) or "?") end },
+    { line = box:Stat(""), get = function() return "Event: " .. (txt(R.event) or "?") end },
+    { line = box:Stat(""), get = function() return "Catches: " .. tostring(Stats.catches) end },
     { line = box:Stat(""), get = function()
         local h = math.max((os.clock() - Stats.start) / 3600, 1 / 3600)
         return "Per hour: " .. fmtMoney(Stats.earned / h)
     end },
-    { line = box:Text(""), get = function() return "Best: " .. (Stats.best or "-") end },
+    { line = box:Stat(""), get = function() return "Best: " .. (Stats.best or "-") end },
 }
 task.spawn(function()
     while Hub.running do
@@ -701,6 +2200,8 @@ end)
 function Hub.Unload(keepMenu)
     if not Hub.running then return end
     Hub.running = false
+    -- give the aim back to the mouse before anything else stops
+    pcall(AimMem.release)
     for _, c in ipairs(Hub.conns) do pcall(function() c:Disconnect() end) end
     for _, d in ipairs(Hub.drawings) do pcall(function() d.Visible = false end) end
     local drawings = Hub.drawings
@@ -708,11 +2209,33 @@ function Hub.Unload(keepMenu)
     task.delay(0.5, function()
         for _, d in ipairs(drawings) do pcall(function() d:Remove() end) end
     end)
-    if not keepMenu then _G.INSuiInstance = {} end
+    if not keepMenu then
+        -- The library's teardown deletes its shapes but not its pictures
+        -- (profile picture, logo, backdrop): whatever is visible at that
+        -- moment stays stuck on screen for good. Closing the menu first hides
+        -- them, so once its close animation has run they're left invisible.
+        pcall(function() Lib:SetOpen(false) end)
+        task.delay(0.4, function() _G.INSuiInstance = {} end)
+    end
     if _G.DeepFishHub == Hub then _G.DeepFishHub = nil end
 end
 
-Hub.debug = { S = S, R = R, Odds = Odds, Stats = Stats, Cast = Cast, School = function() return School end, holdTime = holdTime }
+Hub.debug = {
+    S = S, R = R, Odds = Odds, Stats = Stats, Cast = Cast, Steer = Steer, Guard = Guard, CatchLog = CatchLog,
+    AimMem = AimMem, AimFit = AimFit,
+    School = function() return School end, holdTime = holdTime,
+    rodSlotKey = rodSlotKey, inventoryFull = inventoryFull, findStaff = findStaff, validWebhook = validWebhook,
+}
 
-local fishKnown = 0 for _ in pairs(Odds) do fishKnown = fishKnown + 1 end
-Lib:Notify("Deep Fishing", "Loaded - P opens the menu, F6 toggles auto cast. " .. fishKnown .. " fish known.", 6, "success")
+local fishKnown = 0 for _ in pairs(Price) do fishKnown = fishKnown + 1 end
+Lib:Notify("Deep Fishing", "Loaded - P opens the menu, F6 toggles auto cast. " .. fishKnown .. " fish priced.", 6, "success")
+
+end -- main
+
+task.spawn(function()
+    -- the old menu needs ~0.4s to close and ~0.1s more to tear down
+    if previous then task.wait(1) end
+    if _G.DeepFishLoadId ~= myLoad then return end -- a newer load took over
+    local ok, err = pcall(main)
+    if not ok then warn("[DeepFish] failed to load: " .. tostring(err)) end
+end)
