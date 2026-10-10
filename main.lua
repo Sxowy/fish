@@ -1182,6 +1182,25 @@ end
 local ROUTE_LAT_SPEED = 60 -- studs/s the bait can move sideways, conservatively
 local ROUTE_SLACK = 3
 
+-- Every fish's sideways swim speed, smoothed. Fish in this game cross the
+-- school on set paths at a fairly steady speed, so this predicts well where
+-- each one will be when the rising bait reaches its height.
+local PREDICT_MAX = 2.5 -- seconds ahead; a fish's crossing doesn't last forever
+local function fishVelocity(f, lat, now)
+    Steer.fishVel = Steer.fishVel or {}
+    local key = f.id or f.name
+    local rec = Steer.fishVel[key]
+    if not rec then
+        rec = { lat = lat, t = now, v = 0 }
+        Steer.fishVel[key] = rec
+    elseif now - rec.t > 0.02 then
+        local v = math.clamp((lat - rec.lat) / (now - rec.t), -FISH_SPEED_CAP, FISH_SPEED_CAP)
+        rec.v = rec.v + (v - rec.v) * 0.3
+        rec.lat, rec.t = lat, now
+    end
+    return rec.v
+end
+
 local function planRoute(baitPos, axis, half)
     local baitY, baitLat = baitPos.Y, baitPos:Dot(axis)
     local rise = math.max(Cast.rise or 10, 2)
@@ -1196,15 +1215,13 @@ local function planRoute(baitPos, axis, half)
             if f.score > 0 and not f.useless and not Steer.caught[f.id or 0] then
                 local pos = entryPos(f)
                 if pos and pos.Y >= baitY - 1 then
-                    local lat = pos:Dot(axis)
+                    -- every fish in the cast, on screen or not, at the lane it
+                    -- will be in when the bait reaches its height
+                    local now = os.clock()
+                    local eta = math.max(pos.Y - baitY, 0) / rise
+                    local lat = pos:Dot(axis) + fishVelocity(f, pos:Dot(axis), now) * math.min(eta, PREDICT_MAX)
                     local keep = goalPointer(lat, half) ~= nil
                     if not keep then why.reach = why.reach + 1 end
-                    -- only fish visible on screen right now; one that swims out
-                    -- of view drops out of the route at the next re-plan
-                    if keep and not onScreen(pos) then
-                        keep = false
-                        why.screen = why.screen + 1
-                    end
                     if keep then why.ok = why.ok + 1 end
                     if keep then
                         cands[#cands + 1] = { f = f, y = pos.Y, lat = lat, worth = routeWorth(f) }
@@ -1885,23 +1902,13 @@ local function renderStep(dt)
                 if pos then
                     local gap = pos.Y - baitPos.Y
                     local lat = pos:Dot(axis)
-                    -- each fish's sideways swim speed, smoothed
-                    local key = f.id or f.name
-                    local rec = Steer.fishVel[key]
-                    if not rec then
-                        rec = { lat = lat, t = now, v = 0 }
-                        Steer.fishVel[key] = rec
-                    elseif now - rec.t > 0.02 then
-                        local v = math.clamp((lat - rec.lat) / (now - rec.t), -FISH_SPEED_CAP, FISH_SPEED_CAP)
-                        rec.v = rec.v + (v - rec.v) * 0.3
-                        rec.lat, rec.t = lat, now
-                    end
+                    local vel = fishVelocity(f, lat, now)
                     -- still above the bait only: one riding just below is
                     -- already hooked and dodging it does nothing
                     if gap > -0.5 and gap < limit then
                         local eta = math.max(gap, 0) / rise
                         hazards[#hazards + 1] = {
-                            lat = lat + rec.v * math.min(eta, 0.6),
+                            lat = lat + vel * math.min(eta, 0.6),
                             r = f.halfWidth * FISH_MAGNET + pad,
                             eta = eta,
                         }
