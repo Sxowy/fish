@@ -1686,7 +1686,16 @@ local function renderStep(dt)
         -- aim slots: found by a background scan when a cast starts, checked
         -- every frame before anything touches them
         aimLive = AimMem.valid()
-        if not aimLive then AimMem.locate() end
+        if not aimLive then
+            -- The game can reorganize the table mid-cast too. A slot that was
+            -- live and died earns one rescue search in this same cast;
+            -- without it steering sat idle for the rest of the cast.
+            if AimMem.aim then
+                AimMem.aim, AimMem.ptr = nil, nil
+                AimMem.wantRescue = true
+            end
+            AimMem.locate()
+        end
     end
     -- a fish fighting on the line pins the bait: no steering, no learning
     local fightNow = Cast.fighting or false
