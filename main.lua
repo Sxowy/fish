@@ -1248,7 +1248,8 @@ local function planRoute(baitPos, axis, half)
     end
     table.sort(cands, function(p, q) return p.y < q.y end)
 
-    local n, K = #cands, math.min(left, 12)
+    -- every free slot (13+ with upgrades); the cap only bounds the work
+    local n, K = #cands, math.min(left, 30)
     local best, prevOf = {}, {}
     local topV, topI, topK = 0, nil, 0
     for i = 1, n do
