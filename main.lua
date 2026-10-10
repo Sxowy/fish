@@ -1847,7 +1847,8 @@ local function renderStep(dt)
                 local clear = math.huge
                 for _, h in ipairs(hazards) do
                     -- a fish about to arrive matters more than one far above
-                    local c = (math.abs(x - h.lat) - h.r) * (1 + h.gap / rise)
+                    -- (far ones get slack: the bait has time to move later)
+                    local c = (math.abs(x - h.lat) - h.r) + (h.gap / rise) * 3
                     if c < clear then clear = c end
                 end
                 local score = math.min(clear, 12) - math.abs(x - here) * 0.05
