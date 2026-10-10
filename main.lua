@@ -897,16 +897,22 @@ function AimMem.locate()
         local ptrs = #aims > 0 and scanAll("AimPointer") or {}
         local vp = camera.ViewportSize
         local mousePtr = math.clamp(mouse.X / math.max(vp.X, 1) * 2 - 1, -1, 1)
+        -- mid-cast rescue: the live pointer holds what we last wrote, not the
+        -- mouse
+        local expect = (AimMem.wantRescue and AimMem.lastPtrWritten) or mousePtr
         local aim, ptr, bestErr = nil, nil, math.huge
         for _, p in ipairs(ptrs) do
             local okV, v = pcall(memory_read, "double", p)
-            if okV and type(v) == "number" then
+            -- skip copies whose memory has been reused (garbage values)
+            if okV and type(v) == "number" and v == v and math.abs(v) <= 1.5 then
                 local nearA, nearD = nil, 32768
                 for _, a in ipairs(aims) do
                     local d = math.abs(a - p)
-                    if d < nearD then nearA, nearD = a, d end
+                    local okA, av = pcall(memory_read, "double", a)
+                    local sane = okA and type(av) == "number" and av == av and math.abs(av) <= 60
+                    if sane and d < nearD then nearA, nearD = a, d end
                 end
-                local err = math.abs(v - mousePtr)
+                local err = math.abs(v - expect)
                 if nearA and err < bestErr then aim, ptr, bestErr = nearA, p, err end
             end
         end
@@ -970,6 +976,7 @@ function AimMem.write(offset, half, sign, chasing)
     if not ptr or math.abs(ptr - want) > 0.002 then
         pcall(memory_write, "double", AimMem.ptr, want)
     end
+    AimMem.lastPtrWritten = want
     AimMem.held = true
 end
 
