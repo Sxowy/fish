@@ -53,7 +53,7 @@ local S = {
     steerMode = "Direct", -- the only steering mode
     goForItems = true,
     targetMode = "Value",
-    minValue = 100,
+    minValue = 0, -- 0 = Auto: no fixed floor, the planner keeps the best fish for the slots
     fishEsp = false,
     espJunk = false,
     eventAlerts = true,
@@ -2141,11 +2141,19 @@ local sSteer = tFish:Section("Steering", "Right", "aims the bait at the most val
 UI.autoSteer = sSteer:Toggle("Auto steer", S.autoSteer, function(on) S.autoSteer = on end)
 sSteer:Toggle("Go for items", S.goForItems, function(on) S.goForItems = on end, "enchant stones, scrolls, chests, keys, baits, potions")
 sSteer:Toggle("Avoid useless", S.avoidJunk, function(on) S.avoidJunk = on end, "steer around junk and fish under the minimum value")
-sSteer:Dropdown("Min value", { fmtShort(S.minValue) }, { "$0", "$50", "$100", "$500", "$1K", "$10K", "$100K" }, false, function(v)
+-- "Min fish value" (renamed from "Min value" so the new Auto default applies
+-- instead of an old saved number). Auto: no fixed floor. Slots come from the
+-- game's own caught/cap counter, so upgrades need no setting change, and the
+-- planner keeps the most valuable fish for them, dodging the rest.
+sSteer:Dropdown("Min fish value", { S.minValue <= 0 and "Auto" or fmtShort(S.minValue) }, { "Auto", "$100", "$500", "$1K", "$10K", "$100K" }, false, function(v)
     v = (type(v) == "table" and v[1]) or v
+    if v == "Auto" then
+        S.minValue = 0
+        return
+    end
     local n = num(tostring(v or ""):gsub("%$", ""))
     if n then S.minValue = n end
-end, "fish worth less than this are never chased and get dodged")
+end, "Auto fills your slots with the best fish on screen; a set value never chases anything cheaper")
 -- Direct is the only steering mode (it moves the bait itself, no mouse)
 sSteer:Dropdown("Go for", { S.targetMode }, { "Value", "Rarity", "Most fish" }, false, function(v)
     S.targetMode = (type(v) == "table" and v[1]) or v or "Value"
