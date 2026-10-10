@@ -874,6 +874,7 @@ end
 
 function AimMem.locate()
     local now = os.clock()
+    local rescuing = AimMem.wantRescue == true
     -- the scan blocks this script for ~2s (not the game). After a failed scan
     -- wait a while; after a good one the table may simply have moved again
     local wait = AimMem.lastFailed and 10 or 0.5
@@ -899,7 +900,7 @@ function AimMem.locate()
         local mousePtr = math.clamp(mouse.X / math.max(vp.X, 1) * 2 - 1, -1, 1)
         -- mid-cast rescue: the live pointer holds what we last wrote, not the
         -- mouse
-        local expect = (AimMem.wantRescue and AimMem.lastPtrWritten) or mousePtr
+        local expect = (rescuing and AimMem.lastPtrWritten) or mousePtr
         local aim, ptr, bestErr = nil, nil, math.huge
         for _, p in ipairs(ptrs) do
             local okV, v = pcall(memory_read, "double", p)
