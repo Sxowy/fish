@@ -793,7 +793,8 @@ local Steer = {
     manualUntil = 0,
 }
 local STEER_DEADZONE = 6
-local FISH_MAGNET = 1.5     -- the game's CatchBandScale with Fish Magnet on (default)
+-- the game's CatchBandScale: 1.5 with the Fish Magnet gamepass, 1 without
+local FISH_MAGNET = 1
 local MAX_OFFSET = 48       -- game caps the offset at 50 studs
 local POINTER_LIMIT = 0.94  -- keep the cursor off the very edge
 local SWITCH_RATIO = 1.5    -- a new fish must be worth this much more to switch
@@ -1751,6 +1752,7 @@ local function renderStep(dt)
 
     -- where the bait should be sideways (studs along the axis), or nil
     local goalLat = nil
+    local idleLane = false
     local target = Steer.target
     local targetPos = target and entryPos(target)
     if axis and targetPos then
@@ -1794,6 +1796,7 @@ local function renderStep(dt)
         -- (a dodge pushed it out, the hold kept it out, the next dodge pushed
         -- further) until the offset pinned at the cap.
         goalLat = Steer.landing or baitPos:Dot(axis)
+        idleLane = true
     end
 
     -- Dodge fish the bait mustn't take. With a target, only ones the bait
@@ -1831,6 +1834,26 @@ local function renderStep(dt)
                     end
                 end
             end
+        end
+        -- Nothing worth chasing: don't park and wait to be hit. Look across
+        -- every reachable lane (1 stud apart) for the one furthest from any
+        -- unwanted fish coming up, closer ones counting more, and go there;
+        -- nearer lanes win ties so it doesn't jump about.
+        if idleLane and #hazards > 0 and Steer.landing and half then
+            local lim = math.min(MAX_OFFSET, POINTER_LIMIT * half)
+            local here = baitPos:Dot(axis)
+            local bestX, bestScore = goalLat, -math.huge
+            for x = Steer.landing - lim, Steer.landing + lim, 1 do
+                local clear = math.huge
+                for _, h in ipairs(hazards) do
+                    -- a fish about to arrive matters more than one far above
+                    local c = (math.abs(x - h.lat) - h.r) * (1 + h.gap / rise)
+                    if c < clear then clear = c end
+                end
+                local score = math.min(clear, 12) - math.abs(x - here) * 0.05
+                if score > bestScore then bestX, bestScore = x, score end
+            end
+            goalLat = bestX
         end
         -- step to whichever side of each obstacle keeps the bait closest to
         -- where it wanted to be
