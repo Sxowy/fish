@@ -1055,9 +1055,9 @@ local function planRoute(baitPos, axis, half)
                 if pos and pos.Y >= baitY - 1 then
                     local lat = pos:Dot(axis)
                     local keep = goalPointer(lat, half) ~= nil
-                    -- only fish that have shown up on screen, unless it is
-                    -- already in the route (it may swim out of view)
-                    if keep and not onScreen(pos) and not (Steer.routeIds and Steer.routeIds[f.id or 0]) then
+                    -- only fish visible on screen right now; one that swims out
+                    -- of view drops out of the route at the next re-plan
+                    if keep and not onScreen(pos) then
                         keep = false
                     end
                     if keep then
