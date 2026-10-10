@@ -1,8 +1,3 @@
--- Deep Fishing hub for Matcha, UI by INSUI
--- loadstring(game:HttpGet("https://raw.githubusercontent.com/Sxowy/fish/main/main.lua"))()
-
--- a previous copy stops its loops here; its menu removes itself once the
--- fresh library below registers as the new instance
 if _G.DeepFishHub and _G.DeepFishHub.Unload then
     pcall(_G.DeepFishHub.Unload, true)
 end
