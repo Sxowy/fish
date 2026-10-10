@@ -888,20 +888,25 @@ function AimMem.read() return readNum(AimMem.aim) end
 -- half-width at the bait, sign included). No lock: moving the mouse hands
 -- control straight back. One number slot, only when it changes.
 --
--- k starts from the camera geometry and is refined from what the game does
--- with the pointer once AimOffset has settled.
-function AimMem.write(offset, half)
+-- k comes from the camera geometry (the game's own formula: screen half-width
+-- at the bait), with the direction calibration measured. An earlier version
+-- learned k from AimOffset / AimPointer, but while AimOffset is still easing
+-- after a pointer change that ratio briefly has the wrong sign, and those
+-- samples dragged k from about +25 to -4.6. Any leftover scale error is
+-- trimmed by a slow correction toward the offset we actually asked for.
+function AimMem.write(offset, half, sign)
     local ptr = readNum(AimMem.ptr)
     local cur = AimMem.read()
-    if ptr and cur and math.abs(ptr) > 0.15 then
-        local est = cur / ptr
-        if math.abs(est) > 5 and math.abs(est) < 200 then
-            AimMem.k = AimMem.k and (AimMem.k + (est - AimMem.k) * 0.05) or est
-        end
+    local k = (half and half > 5 and half or 25) * (sign or 1)
+    AimMem.k = k
+    -- only while the goal holds steady: during a big move the game is still
+    -- easing toward it, and that gap isn't a scale error
+    if cur and AimMem.lastWant and math.abs(offset - AimMem.lastWant) < 0.5 then
+        local miss = AimMem.lastWant - cur
+        AimMem.corr = math.clamp((AimMem.corr or 0) + miss * 0.02, -15, 15)
     end
-    local k = AimMem.k or half or 25
-    if math.abs(k) < 5 then k = (k < 0 and -5 or 5) end
-    local want = math.clamp(offset / k, -1, 1)
+    local want = math.clamp((offset + (AimMem.corr or 0)) / k, -1, 1)
+    AimMem.lastWant = offset
     if not ptr or math.abs(ptr - want) > 0.002 then
         pcall(memory_write, "double", AimMem.ptr, want)
     end
@@ -1636,6 +1641,7 @@ local function renderStep(dt)
         if not casting then
             Steer.caughtCount, Steer.caughtThisCast = nil, nil
             if next(Steer.logged) then Steer.logged = {} end
+            AimMem.corr, AimMem.lastWant = 0, nil
             if next(Steer.caught) then Steer.caught = {} end
             if AimFit.landing then AimFit.reset() end
         end
@@ -1761,7 +1767,7 @@ local function renderStep(dt)
         if goalLat and Steer.landing and aimLive and not fightNow and not paused then
             Steer.dbgGoal = goalLat
             local offset = math.clamp((goalLat - Steer.landing) / AimFit.slope, -MAX_OFFSET, MAX_OFFSET)
-            AimMem.write(offset, half)
+            AimMem.write(offset, half, AimFit.slope)
             if S.fishEsp and targetPos then
                 local scr, vis = WorldToScreen(targetPos)
                 targetRing.Visible = vis == true
