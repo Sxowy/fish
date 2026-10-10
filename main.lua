@@ -585,6 +585,7 @@ Stats.lastCash = num(txt(R.cash))
 ---------------------------------------------------------------------------
 
 local Cast = {
+    castNo = 0,
     lastActive = 0,     -- last time something showed a cast in progress
     lastRelease = -1e9,
     lastThrowText = nil,
@@ -840,7 +841,11 @@ end
 -- around AimOffset; when that block ran past the table's memory Matcha tried
 -- to decode garbage and crashed. Nothing here reads outside a scan result.
 -- (The scan skips fields that are false or zero, hence a few anchors.)
-local AIM_ANCHORS = { "ThrowDistance", "Catchable", "PullUpDuration", "ArcHeight" }
+-- Every scan walks the game's memory while the game is changing it, and
+-- Windows logged Matcha dying with access violations while scans ran. So:
+-- one anchor (ThrowDistance is filled in from the moment of the throw), at
+-- most one search per cast, and a long pause after a failed one.
+local AIM_ANCHORS = { "ThrowDistance" }
 
 local function scanFor(field)
     for _, anchor in ipairs(AIM_ANCHORS) do
@@ -854,8 +859,10 @@ function AimMem.locate()
     local now = os.clock()
     -- the scan blocks this script for ~2s (not the game). After a failed scan
     -- wait a while; after a good one the table may simply have moved again
-    local wait = AimMem.lastFailed and 3 or 0.5
+    local wait = AimMem.lastFailed and 10 or 0.5
     if AimMem.locating or now - AimMem.lastLocate < wait then return end
+    if AimMem.searchedCast and AimMem.searchedCast == Cast.castNo then return end
+    AimMem.searchedCast = Cast.castNo
     AimMem.locating, AimMem.lastLocate = true, now
     task.spawn(function()
         local aim = scanFor("AimOffset")
@@ -1439,6 +1446,11 @@ task.spawn(function()
                 Cast.rise = 10
             end
             local th = txt(R.throwDist)
+            -- a throw starting after a pause is a new cast (used to allow
+            -- one memory search per cast)
+            if d == 0 and th ~= Cast.lastThrowText and now - Cast.lastActive > 1.5 then
+                Cast.castNo = (Cast.castNo or 0) + 1
+            end
             if d > 0 or th ~= Cast.lastThrowText then
                 Cast.lastActive = now
             end
