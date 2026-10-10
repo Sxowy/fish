@@ -832,8 +832,18 @@ local function slotIs(addr, key, kind)
     return e ~= nil and tostring(e.key) == key and e.type == kind
 end
 
+-- Labels alone aren't enough: freed memory keeps its labels for a while,
+-- and once it's reused the "AimOffset" there read as a 220-digit number.
+-- Writing into reused memory could crash the game, so the values must be
+-- sane too (the game caps AimOffset at 50, AimPointer is -1..1).
+local function saneNum(addr, limit)
+    local ok, v = pcall(memory_read, "double", addr)
+    return ok and type(v) == "number" and v == v and math.abs(v) <= limit
+end
+
 function AimMem.valid()
     return slotIs(AimMem.aim, "AimOffset", "number") and slotIs(AimMem.ptr, "AimPointer", "number")
+        and saneNum(AimMem.aim, 60) and saneNum(AimMem.ptr, 1.5)
 end
 
 -- Find AimOffset and AimPointer with Matcha's own scan, one field each.
@@ -1500,6 +1510,14 @@ task.spawn(function()
                 Cast.riseAnchor = nil
                 Cast.rise = 10
             end
+            -- The bait came back up: this cast is over. Forget the aim
+            -- addresses (the game reorganizes that table between casts) and
+            -- count a new cast, however quickly the next throw follows.
+            if d == 0 and Cast.wasDeep then
+                Cast.castNo = (Cast.castNo or 0) + 1
+                AimMem.aim, AimMem.ptr = nil, nil
+            end
+            Cast.wasDeep = d > 0
             local th = txt(R.throwDist)
             -- a throw starting after a pause is a new cast (used to allow
             -- one memory search per cast)
