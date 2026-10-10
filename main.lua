@@ -847,12 +847,19 @@ end
 -- most one search per cast, and a long pause after a failed one.
 local AIM_ANCHORS = { "ThrowDistance" }
 
-local function scanFor(field)
+-- every match for a field: live table and dead copies alike
+local function scanAll(field)
+    local out = {}
     for _, anchor in ipairs(AIM_ANCHORS) do
         local ok, res = pcall(findgc, anchor, { [field] = "number" })
-        local e = ok and type(res) == "table" and res[1] or nil
-        if e and tostring(e.key) == field then return e.addr end
+        if ok and type(res) == "table" then
+            for _, e in ipairs(res) do
+                if tostring(e.key) == field and e.addr then out[#out + 1] = e.addr end
+            end
+        end
+        if #out > 0 then break end
     end
+    return out
 end
 
 function AimMem.locate()
@@ -869,8 +876,31 @@ function AimMem.locate()
     AimMem.searchedCast, AimMem.wantRescue = Cast.castNo, false
     AimMem.locating, AimMem.lastLocate = true, now
     task.spawn(function()
-        local aim = scanFor("AimOffset")
-        local ptr = aim and scanFor("AimPointer")
+        -- When the game reorganizes its throw table the old copies stay in
+        -- memory with their labels, and the scan returns all of them; taking
+        -- the first match often picked a dead copy. The live table's
+        -- AimPointer is set from the real mouse at the start of each cast,
+        -- while dead copies hold whatever was last written into them. So pair
+        -- each pointer with the AimOffset stored next to it (same node array,
+        -- within 32 KB) and keep the pair whose pointer matches the mouse.
+        local aims = scanAll("AimOffset")
+        local ptrs = #aims > 0 and scanAll("AimPointer") or {}
+        local vp = camera.ViewportSize
+        local mousePtr = math.clamp(mouse.X / math.max(vp.X, 1) * 2 - 1, -1, 1)
+        local aim, ptr, bestErr = nil, nil, math.huge
+        for _, p in ipairs(ptrs) do
+            local okV, v = pcall(memory_read, "double", p)
+            if okV and type(v) == "number" then
+                local nearA, nearD = nil, 32768
+                for _, a in ipairs(aims) do
+                    local d = math.abs(a - p)
+                    if d < nearD then nearA, nearD = a, d end
+                end
+                local err = math.abs(v - mousePtr)
+                if nearA and err < bestErr then aim, ptr, bestErr = nearA, p, err end
+            end
+        end
+        AimMem.candidates = #ptrs
         AimMem.aim, AimMem.ptr = aim, ptr
         AimMem.lastFailed = not (aim and ptr)
         AimMem.scans = (AimMem.scans or 0) + 1
