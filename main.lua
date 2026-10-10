@@ -2363,45 +2363,94 @@ end):SetRisk()
 
 win:AddSettingsTab("gear")
 
--- Box lines only render plain values, so a loop rewrites line.Value.
--- A Stat line splits at its first colon into a label and a right-aligned
--- value, so each one holds exactly one "Label: value" pair.
-local box = Lib:CreateBox({ title = "Deep Fishing", position = Vector2.new(20, 160), width = 210 })
+-- The status box is drawn by this script, not the menu library. A library
+-- box is painted by the library's own frame loop, so whenever that loop
+-- stopped, the box froze on whatever it last showed. These drawings are
+-- created once and rewritten twice a second by a loop of ours.
+local BOX_X, BOX_Y, BOX_W = 20, 160, 230
+local BOX_ROW, BOX_PAD = 18, 8
 local function onOff(v) return v and "ON" or "off" end
-local boxLines = {
-    -- an empty Stat line is skipped, so this row only shows with a warning
-    { line = box:Stat(""), get = function()
-        if S.staffGuard and Guard.staff then return "PAUSED - staff in server" end
-        if S.autoCast and menuOpen() then return "Close the menu so auto cast can click" end
-        return ""
-    end },
-    { line = box:Stat(""), get = function() return "Auto cast: " .. onOff(S.autoCast) end },
-    { line = box:Stat(""), get = function() return "Auto steer: " .. onOff(S.autoSteer) end },
-    { line = box:Stat(""), get = function()
+local boxRows = {
+    function()
+        if S.staffGuard and Guard.staff then return "PAUSED - staff in server", Color3.fromRGB(255, 120, 120) end
+        if S.autoCast and menuOpen() then return "Close the menu so auto cast can click", Color3.fromRGB(255, 200, 90) end
+        return nil
+    end,
+    function() return "Auto cast: " .. onOff(S.autoCast) end,
+    function() return "Auto steer: " .. onOff(S.autoSteer) end,
+    function()
         local r = Steer.route
         if not (r and #r > 0) then return "Route: -" end
         local money = 0
         for _, f in ipairs(r) do money = money + (f.price or 0) end
         return string.format("Route: %d fish, %s", #r, fmtShort(money))
-    end },
-    { line = box:Stat(""), get = function()
+    end,
+    function()
         local t = Steer.target
-        return "Next: " .. (t and t.name or "-")
-    end },
-    { line = box:Stat(""), get = function() return "Event: " .. (txt(R.event) or "?") end },
-    { line = box:Stat(""), get = function() return "Catches: " .. tostring(Stats.catches) end },
-    { line = box:Stat(""), get = function()
+        return "Next: " .. (t and (t.name .. (t.price and ("  " .. fmtShort(t.price)) or "")) or "-")
+    end,
+    function()
+        local left, cap = slotsLeft()
+        return string.format("Slots: %d / %d free", left, cap)
+    end,
+    function() return "Event: " .. (txt(R.event) or "?") end,
+    function() return "Catches: " .. tostring(Stats.catches) end,
+    function()
         local h = math.max((os.clock() - Stats.start) / 3600, 1 / 3600)
         return "Per hour: " .. fmtMoney(Stats.earned / h)
-    end },
-    { line = box:Stat(""), get = function() return "Best: " .. (Stats.best or "-") end },
+    end,
+    function() return "Best: " .. (Stats.best or "-") end,
 }
+
+local boxBg = Drawing.new("Square")
+boxBg.Filled = true
+boxBg.Color = Color3.fromRGB(18, 18, 22)
+boxBg.Transparency = 0.15
+boxBg.Position = Vector2.new(BOX_X, BOX_Y)
+boxBg.Visible = true
+Hub.drawings[#Hub.drawings + 1] = boxBg
+
+local boxTitle = Drawing.new("Text")
+boxTitle.Text = "Deep Fishing"
+boxTitle.Size = 15
+boxTitle.Outline = true
+boxTitle.Color = Color3.fromRGB(160, 150, 255)
+boxTitle.Position = Vector2.new(BOX_X + BOX_PAD, BOX_Y + 6)
+boxTitle.Visible = true
+Hub.drawings[#Hub.drawings + 1] = boxTitle
+
+local boxText = {}
+for i = 1, #boxRows do
+    local t = Drawing.new("Text")
+    t.Size = 13
+    t.Outline = true
+    t.Color = Color3.fromRGB(220, 222, 230)
+    t.Visible = false
+    boxText[i] = t
+    Hub.drawings[#Hub.drawings + 1] = t
+end
+
+local function drawBox()
+    local y = BOX_Y + 6 + BOX_ROW + 4
+    for i, row in ipairs(boxRows) do
+        local ok, text, color = pcall(row)
+        local t = boxText[i]
+        if ok and text then
+            t.Text = tostring(text)
+            t.Color = color or Color3.fromRGB(220, 222, 230)
+            t.Position = Vector2.new(BOX_X + BOX_PAD, y)
+            t.Visible = true
+            y = y + BOX_ROW
+        else
+            t.Visible = false
+        end
+    end
+    boxBg.Size = Vector2.new(BOX_W, y - BOX_Y + 4)
+end
+
 task.spawn(function()
     while Hub.running do
-        for _, b in ipairs(boxLines) do
-            local ok, v = pcall(b.get)
-            if ok and b.line then b.line.Value = v end
-        end
+        pcall(drawBox)
         task.wait(0.5)
     end
 end)
