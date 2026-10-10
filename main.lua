@@ -708,7 +708,18 @@ local function collectSchool()
                 local okPos, pos = pcall(function() return part and part.Position end)
                 if part and okPos and pos then
                     local okSize, size = pcall(function() return part.Size end)
-                    local price = Price[name]
+                    -- The game's own price tag on the fish (a RarityTag billboard
+                    -- with a Price label) is its real sell value: base price x
+                    -- size^3 x mutation, worked out by the game. Use it when it's
+                    -- there; the species' base price is only the fallback.
+                    local tag = nil
+                    for _, k in ipairs(c:GetChildren()) do
+                        tag = k:FindFirstChild("RarityTag")
+                        if tag then break end
+                    end
+                    local tagPrice = tag and num(txt(tag:FindFirstChild("Price")))
+                    local mutation = tag and txt(tag:FindFirstChild("Mutation"))
+                    local price = tagPrice or Price[name]
                     -- planner worth; items have no real price (see ITEM_PRIORITY)
                     local worth = price
                     if ItemNames[name] then worth = S.goForItems and ITEM_PRIORITY or nil end
@@ -722,13 +733,15 @@ local function collectSchool()
                         id = okId and id or nil,
                         name = name,
                         part = part,
-                        score = useless and 0 or score,
+                        score = useless and 0 or (ItemNames[name] and score) or price or score,
                         useless = useless,
                         -- the game grabs when the bait is inside the hitbox,
                         -- padded to at least 1.25 studs a side
                         halfWidth = math.max(okSize and size and math.max(size.X, size.Z) / 2 or 1.25, 1.25),
                         rarity = ItemNames[name] and "Item" or JunkNames[name] and "Junk" or fishRarity(name),
                         price = price,
+                        realPrice = tagPrice ~= nil,
+                        mutation = mutation,
                         worth = worth,
                     }
                 end
@@ -1851,6 +1864,7 @@ local function renderStep(dt)
                         n = n + 1
                         local e = espPool[n]
                         local label = f.name
+                        if f.mutation and f.mutation ~= "" then label = f.mutation .. " " .. label end
                         if f.price then label = label .. "  " .. fmtShort(f.price) end
                         e.Text = label
                         e.Position = Vector2.new(scr.X, scr.Y - 22)
