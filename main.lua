@@ -53,7 +53,8 @@ local S = {
     keyPanic = "End",
     avoidJunk = true,
     steerSpeed = 4,
-    steerMode = "Direct",
+    -- Direct is opt-in: its memory scans have crashed Matcha
+    steerMode = "Instant",
     goForItems = true,
     targetMode = "Value",
     minValue = 100,
@@ -846,7 +847,9 @@ function AimMem.locate()
         if aim then
             -- AimLocked and FightHeld live in the same node array, a few
             -- hundred slots away
-            local okR, t = pcall(readtbl, aim - 32 * 600, 1200)
+            -- a narrower window: reading far past the table's own block can
+            -- touch memory that isn't there
+            local okR, t = pcall(readtbl, aim - 32 * 256, 512)
             if okR and type(t) == "table" then
                 for _, n in ipairs(t) do
                     local k = tostring(n.key)
@@ -883,10 +886,20 @@ function AimMem.fighting(now)
     return now < (AimMem.fightUntil or 0)
 end
 
--- callers check AimMem.valid() in the same frame first
+-- Callers check AimMem.valid() in the same frame first. Matcha runs outside
+-- the game, so the table can still move between that check and a write;
+-- every write is a small risk, and writing both slots every frame was ~120
+-- a second (a likely cause of game crashes). So: the lock only when it reads
+-- unlocked, the offset only when it actually changes.
 function AimMem.write(offset)
-    pcall(memory_write, "int", AimMem.lock, 1)
-    pcall(memory_write, "double", AimMem.aim, offset)
+    local okL, locked = pcall(memory_read, "int", AimMem.lock)
+    if not (okL and locked == 1) then
+        pcall(memory_write, "int", AimMem.lock, 1)
+    end
+    local cur = AimMem.read()
+    if not cur or math.abs(cur - offset) > 0.05 then
+        pcall(memory_write, "double", AimMem.aim, offset)
+    end
     AimMem.held = true
 end
 
@@ -1972,7 +1985,7 @@ sSteer:Dropdown("Steer mode", { S.steerMode }, { "Direct", "Instant", "Smooth" }
     local mode = (type(v) == "table" and v[1]) or v or "Direct"
     if mode ~= "Direct" then AimMem.release() end
     S.steerMode = mode
-end, "Direct moves the bait itself and leaves your mouse alone; Instant and Smooth drive the cursor")
+end, "Direct (experimental, can crash Matcha) moves the bait itself; Instant and Smooth drive the cursor")
 sSteer:Slider("Smooth speed", S.steerSpeed, 0.5, 1, 10, "", function(v) S.steerSpeed = v end, "only for Smooth: lower is smoother, higher reacts faster")
 sSteer:Dropdown("Go for", { S.targetMode }, { "Value", "Rarity", "Most fish" }, false, function(v)
     S.targetMode = (type(v) == "table" and v[1]) or v or "Value"
