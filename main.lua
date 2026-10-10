@@ -1192,6 +1192,22 @@ local function planRoute(baitPos, axis, half)
             end
         end
     end
+    -- Jackpots: a fish worth far more than the rest of what's visible (5x the
+    -- typical one, or over $50K) must be in the route whenever it can be
+    -- reached, even if a string of cheaper fish adds up to more
+    if #cands > 1 then
+        local worths = {}
+        for i, c in ipairs(cands) do worths[i] = c.worth end
+        table.sort(worths)
+        local typical = worths[math.ceil(#worths / 2)]
+        for _, c in ipairs(cands) do
+            local price = c.f.price or 0
+            if c.worth >= typical * 5 or price >= 50000 then
+                c.worth = c.worth * 10
+                c.jackpot = true
+            end
+        end
+    end
     table.sort(cands, function(p, q) return p.y < q.y end)
 
     local n, K = #cands, math.min(left, 12)
@@ -1762,6 +1778,7 @@ local function renderStep(dt)
         if not casting then
             Steer.caughtCount, Steer.caughtThisCast = nil, nil
             if next(Steer.logged) then Steer.logged = {} end
+            Steer.fishVel = {}
             AimMem.corr, AimMem.lastWant = 0, nil
             if next(Steer.caught) then Steer.caught = {} end
             if AimFit.landing then AimFit.reset() end
@@ -1817,90 +1834,87 @@ local function renderStep(dt)
         idleLane = true
     end
 
-    -- Dodge fish the bait mustn't take. With a target, only ones the bait
-    -- reaches before it: junk above the target can't cost it. Direct control
-    -- answers in ~0.1s, so the look-ahead is 0.8s; through the mouse it has
-    -- to start much earlier.
-    if goalLat then
+    -- Dodging: one lane picker instead of stacked rules. Every reachable lane
+    -- (half a stud apart) gets a cost and the cheapest wins:
+    --   * distance from where the plan wants the bait (the target's lane)
+    --   * a fish the bait will reach soon sitting in that lane: heavy, and
+    --     heavier the sooner it arrives
+    --   * crossing such a fish's lane on the way there: the bait grabs
+    --     whatever it touches sideways too, so that counts as hitting it
+    -- Each fish's position is predicted to the moment the bait reaches its
+    -- height, from how fast that fish is swimming; dodging where fish were
+    -- let them swim into the path.
+    if goalLat and Steer.landing and half then
         local hazards = {}
         local rise = math.max(Cast.rise or 10, 2)
-        local window = direct and rise * 1.2 or 10
+        local window = rise * 1.2
+        -- with a target, only fish the bait meets before it
         local limit = targetPos and math.min(window, (Steer.targetGap or window) - 1) or window
-        local pad = 2.5
+        local pad = 1.5
+        local now = os.clock()
+        Steer.fishVel = Steer.fishVel or {}
+        local routeFull = Steer.route and #Steer.route > 0 and #Steer.route >= (Steer.slotsLeft or 99)
         for _, f in ipairs(School) do
-            -- junk always (when avoiding it); any other fish too when the
-            -- route already needs every slot left, since it would steal one
-            local routeFull = Steer.route and #Steer.route > 0 and #Steer.route >= (Steer.slotsLeft or 99)
             local inRoute = Steer.routeIds and Steer.routeIds[f.id or 0]
-            -- anything the plan didn't choose is in the way: with spare slots it
-            -- used to grab cheap fish along the route
-            -- ("Avoid useless" off: junk is only dodged when the route needs
-            -- every slot)
+            -- anything the plan didn't choose is in the way ("Avoid useless"
+            -- off: junk only when the route needs every slot)
             local obstacle = not inRoute and (S.avoidJunk or not f.useless or routeFull)
             if obstacle and not Steer.caught[f.id or 0] then
                 local pos = entryPos(f)
                 if pos then
+                    local gap = pos.Y - baitPos.Y
+                    local lat = pos:Dot(axis)
+                    -- each fish's sideways swim speed, smoothed
+                    local key = f.id or f.name
+                    local rec = Steer.fishVel[key]
+                    if not rec then
+                        rec = { lat = lat, t = now, v = 0 }
+                        Steer.fishVel[key] = rec
+                    elseif now - rec.t > 0.02 then
+                        local v = math.clamp((lat - rec.lat) / (now - rec.t), -FISH_SPEED_CAP, FISH_SPEED_CAP)
+                        rec.v = rec.v + (v - rec.v) * 0.3
+                        rec.lat, rec.t = lat, now
+                    end
                     -- still above the bait only: one riding just below is
                     -- already hooked and dodging it does nothing
-                    local gap = pos.Y - baitPos.Y
                     if gap > -0.5 and gap < limit then
-                        -- The game grabs anything whose catch box the bait enters,
-                        -- and with its Fish Magnet setting (on by default) that box
-                        -- is 1.5x the fish's size, longest along its body, and fish
-                        -- swim sideways. Dodging the plain hitbox passed far too close.
-                        hazards[#hazards + 1] = { lat = pos:Dot(axis), r = f.halfWidth * FISH_MAGNET + pad, gap = gap }
+                        local eta = math.max(gap, 0) / rise
+                        hazards[#hazards + 1] = {
+                            lat = lat + rec.v * math.min(eta, 0.6),
+                            r = f.halfWidth * FISH_MAGNET + pad,
+                            eta = eta,
+                        }
                     end
                 end
             end
         end
-        -- Nothing worth chasing: don't park and wait to be hit. Look across
-        -- every reachable lane (1 stud apart) for the one furthest from any
-        -- unwanted fish coming up, closer ones counting more, and go there;
-        -- nearer lanes win ties so it doesn't jump about.
-        if idleLane and #hazards > 0 and Steer.landing and half then
+        if #hazards > 0 then
             local lim = math.min(MAX_OFFSET, POINTER_LIMIT * half)
             local here = baitPos:Dot(axis)
-            local bestX, bestScore = goalLat, -math.huge
-            for x = Steer.landing - lim, Steer.landing + lim, 1 do
-                local clear = math.huge
+            local want = goalLat
+            -- idle (nothing to chase): barely care where, mostly care clear
+            local pull = idleLane and 0.05 or 1
+            local bestX, bestCost = goalLat, math.huge
+            for x = Steer.landing - lim, Steer.landing + lim, 0.5 do
+                local cost = math.abs(x - want) * pull + math.abs(x - here) * 0.02
                 for _, h in ipairs(hazards) do
-                    -- a fish about to arrive matters more than one far above
-                    -- (far ones get slack: the bait has time to move later)
-                    local c = (math.abs(x - h.lat) - h.r) + (h.gap / rise) * 3
-                    if c < clear then clear = c end
+                    local urgency = 1 / (0.15 + h.eta)
+                    local overlap = h.r - math.abs(x - h.lat)
+                    if overlap > 0 then
+                        cost = cost + (20 + overlap * 5) * urgency
+                    end
+                    if h.eta < 0.6 then
+                        local lo, hi = h.lat - h.r, h.lat + h.r
+                        local a, b = math.min(here, x), math.max(here, x)
+                        local inside = here > lo and here < hi
+                        if not inside and a < hi and b > lo then
+                            cost = cost + 40 * urgency
+                        end
+                    end
                 end
-                local score = math.min(clear, 12) - math.abs(x - here) * 0.05
-                if score > bestScore then bestX, bestScore = x, score end
+                if cost < bestCost then bestX, bestCost = x, cost end
             end
             goalLat = bestX
-        end
-        -- step to whichever side of each obstacle keeps the bait closest to
-        -- where it wanted to be
-        local want = goalLat
-        for _ = 1, 4 do
-            local moved = false
-            for _, h in ipairs(hazards) do
-                if math.abs(goalLat - h.lat) < h.r then
-                    local side = (want >= h.lat) and 1 or -1
-                    goalLat = h.lat + side * h.r
-                    moved = true
-                end
-            end
-            if not moved then break end
-        end
-        -- The bait grabs whatever it touches on the way, not just where it
-        -- stops. Junk the bait reaches in the next third of a second is a
-        -- wall: don't slide across its lane until the bait has risen past it.
-        local baitLat = baitPos:Dot(axis)
-        for _, h in ipairs(hazards) do
-            if h.gap < rise * 0.6 then
-                local lo, hi = h.lat - h.r, h.lat + h.r
-                if baitLat <= lo and goalLat > lo then
-                    goalLat = lo
-                elseif baitLat >= hi and goalLat < hi then
-                    goalLat = hi
-                end
-            end
         end
     end
 
