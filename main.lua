@@ -1,19 +1,16 @@
 -- Deep Fishing hub for Matcha, UI by INSUI
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/Sxowy/fish/main/main.lua"))()
 
--- Running this again over a live copy: unload the old one fully, then give
--- its menu time to tear itself down before a new menu exists. Loading the
--- new library while the old one is mid-frame errors or crashes Matcha.
--- Each load takes a ticket. If two loads overlap, only the newest one starts:
--- two copies running at once both steer the same bait and fight each other.
+-- Startup is serialized. Two copies starting at once both load the menu
+-- library and draw at the same time while one tears itself down, which has
+-- crashed Matcha; two copies running both steer the same bait. So:
+--   * every execute takes a ticket; only the newest ticket may start
+--   * wait half a second first, so a double execute collapses into one
+--   * if another copy is still loading (the library download takes a second
+--     or two, before it registers), wait for it, then replace it normally:
+--     unload it, give its menu time to close and tear down, then start
 _G.DeepFishLoadId = (_G.DeepFishLoadId or 0) + 1
 local myLoad = _G.DeepFishLoadId
-
-local previous = _G.DeepFishHub
-_G.DeepFishHub = nil
-if previous and previous.Unload then
-    pcall(previous.Unload)
-end
 
 local function main()
 
@@ -2248,9 +2245,25 @@ Lib:Notify("Deep Fishing", "Loaded - P opens the menu, F6 toggles auto cast. " .
 end -- main
 
 task.spawn(function()
-    -- the old menu needs ~0.4s to close and ~0.1s more to tear down
-    if previous then task.wait(1) end
-    if _G.DeepFishLoadId ~= myLoad then return end -- a newer load took over
-    local ok, err = pcall(main)
-    if not ok then warn("[DeepFish] failed to load: " .. tostring(err)) end
+    task.wait(0.5)
+    if _G.DeepFishLoadId ~= myLoad then return end -- a newer execute took over
+    local waited = 0
+    while _G.DeepFishBusy and waited < 15 do
+        task.wait(0.1)
+        waited = waited + 0.1
+    end
+    if _G.DeepFishLoadId ~= myLoad then return end
+    _G.DeepFishBusy = true
+    local previous = _G.DeepFishHub
+    _G.DeepFishHub = nil
+    if previous and previous.Unload then
+        pcall(previous.Unload)
+        -- the old menu needs ~0.4s to close and ~0.1s more to tear down
+        task.wait(1)
+    end
+    if _G.DeepFishLoadId == myLoad then
+        local ok, err = pcall(main)
+        if not ok then warn("[DeepFish] failed to load: " .. tostring(err)) end
+    end
+    _G.DeepFishBusy = false
 end)
