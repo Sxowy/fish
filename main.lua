@@ -1047,8 +1047,14 @@ local function goalPointer(lat, half)
     if not Steer.landing then return nil end
     local offset = lat - Steer.landing
     if math.abs(offset) > MAX_OFFSET then return nil end
-    -- Direct mode has no cursor, only the game's +-50 cap
-    if S.steerMode == "Direct" then return offset end
+    -- Direct steers through the game's mouse pointer, which only reaches the
+    -- screen edge: about half the screen's width at the bait (~25 studs), not
+    -- the game's 50-stud cap. Anything further looked reachable, pinned the
+    -- bait at the edge, and (items rank first) blocked the whole cast.
+    if S.steerMode == "Direct" then
+        if half and math.abs(offset) > POINTER_LIMIT * half then return nil end
+        return offset
+    end
     local p = offset / half
     if math.abs(p) > POINTER_LIMIT then return nil end
     return p
@@ -1133,18 +1139,24 @@ local function planRoute(baitPos, axis, half)
     local left = slotsLeft()
     Steer.slotsLeft = left
     local cands = {}
+    local why = { value = 0, below = 0, reach = 0, screen = 0, ok = 0 }
+    Steer.why = why
     if left > 0 then
         for _, f in ipairs(School) do
+            if f.score <= 0 or f.useless then why.value = why.value + 1 end
             if f.score > 0 and not f.useless and not Steer.caught[f.id or 0] then
                 local pos = entryPos(f)
                 if pos and pos.Y >= baitY - 1 then
                     local lat = pos:Dot(axis)
                     local keep = goalPointer(lat, half) ~= nil
+                    if not keep then why.reach = why.reach + 1 end
                     -- only fish visible on screen right now; one that swims out
                     -- of view drops out of the route at the next re-plan
                     if keep and not onScreen(pos) then
                         keep = false
+                        why.screen = why.screen + 1
                     end
+                    if keep then why.ok = why.ok + 1 end
                     if keep then
                         cands[#cands + 1] = { f = f, y = pos.Y, lat = lat, worth = routeWorth(f) }
                     end
@@ -1827,7 +1839,7 @@ local function renderStep(dt)
     -- a lead can overshoot past where the bait can go; hold it at the edge
     -- of reach instead of giving up on the fish
     if goalLat and Steer.landing and half then
-        local lim = direct and MAX_OFFSET or math.min(MAX_OFFSET, POINTER_LIMIT * half)
+        local lim = math.min(MAX_OFFSET, POINTER_LIMIT * half)
         goalLat = math.clamp(goalLat, Steer.landing - lim, Steer.landing + lim)
     end
 
