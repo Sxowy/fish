@@ -1981,7 +1981,9 @@ sSteer:Dropdown("Min value", { fmtShort(S.minValue) }, { "$0", "$50", "$100", "$
     local n = num(tostring(v or ""):gsub("%$", ""))
     if n then S.minValue = n end
 end, "fish worth less than this are never chased and get dodged")
-sSteer:Dropdown("Steer mode", { S.steerMode }, { "Direct", "Instant", "Smooth" }, false, function(v)
+-- renamed from "Steer mode" so a saved "Direct" from before it was made
+-- opt-in doesn't come back on its own
+sSteer:Dropdown("Steering", { S.steerMode }, { "Direct", "Instant", "Smooth" }, false, function(v)
     local mode = (type(v) == "table" and v[1]) or v or "Direct"
     if mode ~= "Direct" then AimMem.release() end
     S.steerMode = mode
