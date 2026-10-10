@@ -5,7 +5,7 @@ A Matcha script for Deep Fishing, using the [INSUI](https://github.com/neaxusxgo
 ## Load
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/YOURNAME/deep-fishing/main/main.lua"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Sxowy/fish/main/main.lua"))()
 ```
 
 `P` opens the menu. `F6` toggles auto cast.
