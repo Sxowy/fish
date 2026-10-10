@@ -50,8 +50,7 @@ local S = {
     keyPanic = "End",
     avoidJunk = true,
     steerSpeed = 4,
-    -- Direct is opt-in: its memory scans have crashed Matcha
-    steerMode = "Instant",
+    steerMode = "Direct", -- the only steering mode
     goForItems = true,
     targetMode = "Value",
     minValue = 100,
@@ -809,8 +808,9 @@ end
 -- AimOffset / AimLocked is never written to.
 ---------------------------------------------------------------------------
 
-local AimMem = { aim = nil, lock = nil, locating = false, lastLocate = -1e9, held = false }
+local AimMem = { aim = nil, ptr = nil, locating = false, lastLocate = -1e9, held = false, k = nil }
 
+-- reads exactly one node at an address a scan returned; never a raw window
 local function slotIs(addr, key, kind)
     if not addr then return false end
     local ok, t = pcall(readtbl, addr, 1)
@@ -819,90 +819,77 @@ local function slotIs(addr, key, kind)
 end
 
 function AimMem.valid()
-    return slotIs(AimMem.aim, "AimOffset", "number") and slotIs(AimMem.lock, "AimLocked", "boolean")
+    return slotIs(AimMem.aim, "AimOffset", "number") and slotIs(AimMem.ptr, "AimPointer", "number")
+end
+
+-- Find AimOffset and AimPointer with Matcha's own scan, one field each.
+-- An earlier version found AimLocked by reading a wide block of raw memory
+-- around AimOffset; when that block ran past the table's memory Matcha tried
+-- to decode garbage and crashed. Nothing here reads outside a scan result.
+-- (The scan skips fields that are false or zero, hence a few anchors.)
+local AIM_ANCHORS = { "ThrowDistance", "Catchable", "PullUpDuration", "ArcHeight" }
+
+local function scanFor(field)
+    for _, anchor in ipairs(AIM_ANCHORS) do
+        local ok, res = pcall(findgc, anchor, { [field] = "number" })
+        local e = ok and type(res) == "table" and res[1] or nil
+        if e and tostring(e.key) == field then return e.addr end
+    end
 end
 
 function AimMem.locate()
     local now = os.clock()
     -- the scan blocks this script for ~2s (not the game). After a failed scan
-    -- wait a while; after a good one the table may simply have moved again,
-    -- so look again right away
+    -- wait a while; after a good one the table may simply have moved again
     local wait = AimMem.lastFailed and 3 or 0.5
     if AimMem.locating or now - AimMem.lastLocate < wait then return end
     AimMem.locating, AimMem.lastLocate = true, now
     task.spawn(function()
-        -- Matcha's scan skips anchors whose value is false or zero, and
-        -- Catchable is false at the start of a cast, so try a few fields the
-        -- throw controller always has filled in
-        local e = nil
-        for _, anchor in ipairs({ "ThrowDistance", "Catchable", "PullUpDuration", "ArcHeight" }) do
-            local ok, res = pcall(findgc, anchor, { AimOffset = "number" })
-            e = ok and type(res) == "table" and res[1] or nil
-            if e then break end
-        end
-        local aim, lock, fight = e and e.addr, nil, nil
-        if aim then
-            -- AimLocked and FightHeld live in the same node array, a few
-            -- hundred slots away
-            -- a narrower window: reading far past the table's own block can
-            -- touch memory that isn't there
-            local okR, t = pcall(readtbl, aim - 32 * 256, 512)
-            if okR and type(t) == "table" then
-                for _, n in ipairs(t) do
-                    local k = tostring(n.key)
-                    if k == "AimLocked" and n.type == "boolean" then lock = n.addr end
-                    if k == "FightHeld" and n.type == "number" then fight = n.addr end
-                    if lock and fight then break end
-                end
-            end
-        end
-        AimMem.aim, AimMem.lock, AimMem.fight = aim, lock, fight
-        AimMem.lastFailed = not (aim and lock)
+        local aim = scanFor("AimOffset")
+        local ptr = aim and scanFor("AimPointer")
+        AimMem.aim, AimMem.ptr = aim, ptr
+        AimMem.lastFailed = not (aim and ptr)
         AimMem.scans = (AimMem.scans or 0) + 1
         AimMem.lastScanTime = os.clock() - now
         AimMem.locating = false
     end)
 end
 
-function AimMem.read()
-    local ok, v = pcall(memory_read, "double", AimMem.aim)
+local function readNum(addr)
+    local ok, v = pcall(memory_read, "double", addr)
     if ok and type(v) == "number" and v == v then return v end
 end
 
--- The game counts FightHeld up only while a fish is fighting on the line,
--- and pins the bait in place for the fight. Any change since last frame =
--- a fight is on. Read-only; a stale slot is just ignored.
-function AimMem.fighting(now)
-    if slotIs(AimMem.fight, "FightHeld", "number") then
-        local ok, v = pcall(memory_read, "double", AimMem.fight)
-        if ok and type(v) == "number" then
-            if AimMem.lastFight and v ~= AimMem.lastFight then AimMem.fightUntil = now + 0.5 end
-            AimMem.lastFight = v
+function AimMem.read() return readNum(AimMem.aim) end
+
+-- Steer by writing AimPointer, where the game thinks the mouse is (-1..1).
+-- While the real mouse is still the game keeps the stored pointer and eases
+-- AimOffset toward pointer * k (k = studs per pointer unit, about the screen
+-- half-width at the bait, sign included). No lock: moving the mouse hands
+-- control straight back. One number slot, only when it changes.
+--
+-- k starts from the camera geometry and is refined from what the game does
+-- with the pointer once AimOffset has settled.
+function AimMem.write(offset, half)
+    local ptr = readNum(AimMem.ptr)
+    local cur = AimMem.read()
+    if ptr and cur and math.abs(ptr) > 0.15 then
+        local est = cur / ptr
+        if math.abs(est) > 5 and math.abs(est) < 200 then
+            AimMem.k = AimMem.k and (AimMem.k + (est - AimMem.k) * 0.05) or est
         end
     end
-    return now < (AimMem.fightUntil or 0)
-end
-
--- Callers check AimMem.valid() in the same frame first. Matcha runs outside
--- the game, so the table can still move between that check and a write;
--- every write is a small risk, and writing both slots every frame was ~120
--- a second (a likely cause of game crashes). So: the lock only when it reads
--- unlocked, the offset only when it actually changes.
-function AimMem.write(offset)
-    local okL, locked = pcall(memory_read, "int", AimMem.lock)
-    if not (okL and locked == 1) then
-        pcall(memory_write, "int", AimMem.lock, 1)
-    end
-    local cur = AimMem.read()
-    if not cur or math.abs(cur - offset) > 0.05 then
-        pcall(memory_write, "double", AimMem.aim, offset)
+    local k = AimMem.k or half or 25
+    if math.abs(k) < 5 then k = (k < 0 and -5 or 5) end
+    local want = math.clamp(offset / k, -1, 1)
+    if not ptr or math.abs(ptr - want) > 0.002 then
+        pcall(memory_write, "double", AimMem.ptr, want)
     end
     AimMem.held = true
 end
 
--- hand the aim back to the mouse
+-- nothing is locked, so there is nothing to hand back
 function AimMem.release()
-    if AimMem.held and AimMem.valid() then pcall(memory_write, "int", AimMem.lock, 0) end
     AimMem.held = false
 end
 
@@ -1588,7 +1575,7 @@ local function renderStep(dt)
         if not aimLive then AimMem.locate() end
     end
     -- a fish fighting on the line pins the bait: no steering, no learning
-    local fightNow = Cast.fighting or (aimLive and AimMem.fighting(os.clock())) or false
+    local fightNow = Cast.fighting or false
 
     -- landing spot estimate. Direct: fitted from the offset we read back
     -- against where the bait really is. Mouse modes: bait position minus
@@ -1749,7 +1736,7 @@ local function renderStep(dt)
         if goalLat and Steer.landing and aimLive and not fightNow and not paused then
             Steer.dbgGoal = goalLat
             local offset = math.clamp((goalLat - Steer.landing) / AimFit.slope, -MAX_OFFSET, MAX_OFFSET)
-            AimMem.write(offset)
+            AimMem.write(offset, half)
             if S.fishEsp and targetPos then
                 local scr, vis = WorldToScreen(targetPos)
                 targetRing.Visible = vis == true
@@ -1978,14 +1965,7 @@ sSteer:Dropdown("Min value", { fmtShort(S.minValue) }, { "$0", "$50", "$100", "$
     local n = num(tostring(v or ""):gsub("%$", ""))
     if n then S.minValue = n end
 end, "fish worth less than this are never chased and get dodged")
--- renamed from "Steer mode" so a saved "Direct" from before it was made
--- opt-in doesn't come back on its own
-sSteer:Dropdown("Steering", { S.steerMode }, { "Direct", "Instant", "Smooth" }, false, function(v)
-    local mode = (type(v) == "table" and v[1]) or v or "Direct"
-    if mode ~= "Direct" then AimMem.release() end
-    S.steerMode = mode
-end, "Direct (experimental, can crash Matcha) moves the bait itself; Instant and Smooth drive the cursor")
-sSteer:Slider("Smooth speed", S.steerSpeed, 0.5, 1, 10, "", function(v) S.steerSpeed = v end, "only for Smooth: lower is smoother, higher reacts faster")
+-- Direct is the only steering mode (it moves the bait itself, no mouse)
 sSteer:Dropdown("Go for", { S.targetMode }, { "Value", "Rarity", "Most fish" }, false, function(v)
     S.targetMode = (type(v) == "table" and v[1]) or v or "Value"
 end, "Value: most money per cast. Rarity: rarest first. Most fish: fill every slot")
