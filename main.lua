@@ -861,8 +861,12 @@ function AimMem.locate()
     -- wait a while; after a good one the table may simply have moved again
     local wait = AimMem.lastFailed and 10 or 0.5
     if AimMem.locating or now - AimMem.lastLocate < wait then return end
-    if AimMem.searchedCast and AimMem.searchedCast == Cast.castNo then return end
-    AimMem.searchedCast = Cast.castNo
+    if AimMem.searchedCast == Cast.castNo then
+        -- already searched this cast: one more only if the slots went dead
+        if not AimMem.wantRescue or AimMem.rescuedCast == Cast.castNo then return end
+        AimMem.rescuedCast = Cast.castNo
+    end
+    AimMem.searchedCast, AimMem.wantRescue = Cast.castNo, false
     AimMem.locating, AimMem.lastLocate = true, now
     task.spawn(function()
         local aim = scanFor("AimOffset")
@@ -894,7 +898,7 @@ function AimMem.read() return readNum(AimMem.aim) end
 -- after a pointer change that ratio briefly has the wrong sign, and those
 -- samples dragged k from about +25 to -4.6. Any leftover scale error is
 -- trimmed by a slow correction toward the offset we actually asked for.
-function AimMem.write(offset, half, sign)
+function AimMem.write(offset, half, sign, chasing)
     local ptr = readNum(AimMem.ptr)
     local cur = AimMem.read()
     local k = (half and half > 5 and half or 25) * (sign or 1)
@@ -906,6 +910,22 @@ function AimMem.write(offset, half, sign)
         AimMem.corr = math.clamp((AimMem.corr or 0) + miss * 0.02, -15, 15)
     end
     local want = math.clamp((offset + (AimMem.corr or 0)) / k, -1, 1)
+    -- Dead memory looks valid (see the cast counter): if AimOffset hasn't
+    -- budged for a second while we keep asking for different positions,
+    -- drop the slots and allow one rescue search this cast
+    -- (only counts frames while chasing a fish: at the end of a cast the game
+    -- holds the aim itself for the reel-in, and that isn't dead memory)
+    if cur ~= AimMem.prevCur then
+        AimMem.frozenFrames = 0
+    elseif chasing and AimMem.prevWant and math.abs(want - AimMem.prevWant) > 0.01 then
+        AimMem.frozenFrames = (AimMem.frozenFrames or 0) + 1
+        if AimMem.frozenFrames > 30 then
+            AimMem.aim, AimMem.ptr, AimMem.frozenFrames = nil, nil, 0
+            AimMem.wantRescue = true
+            return
+        end
+    end
+    AimMem.prevCur, AimMem.prevWant = cur, want
     AimMem.lastWant = offset
     if not ptr or math.abs(ptr - want) > 0.002 then
         pcall(memory_write, "double", AimMem.ptr, want)
@@ -1455,6 +1475,10 @@ task.spawn(function()
             -- one memory search per cast)
             if d == 0 and th ~= Cast.lastThrowText and now - Cast.lastActive > 1.5 then
                 Cast.castNo = (Cast.castNo or 0) + 1
+                -- The game reorganizes its throw table between casts and the
+                -- abandoned copy keeps the old labels, so a slot can look valid
+                -- while being dead memory. Don't trust last cast's addresses.
+                AimMem.aim, AimMem.ptr = nil, nil
             end
             if d > 0 or th ~= Cast.lastThrowText then
                 Cast.lastActive = now
@@ -1463,7 +1487,7 @@ task.spawn(function()
             -- isn't in the water yet): find the aim fields now, during the
             -- ~2s flight, so steering is ready at the splash
             if d == 0 and th ~= Cast.lastThrowText and S.autoSteer and S.steerMode == "Direct"
-                and not AimMem.valid() then
+                and not AimMem.aim then
                 AimMem.locate()
             end
             Cast.lastThrowText = th
@@ -1767,7 +1791,7 @@ local function renderStep(dt)
         if goalLat and Steer.landing and aimLive and not fightNow and not paused then
             Steer.dbgGoal = goalLat
             local offset = math.clamp((goalLat - Steer.landing) / AimFit.slope, -MAX_OFFSET, MAX_OFFSET)
-            AimMem.write(offset, half, AimFit.slope)
+            AimMem.write(offset, half, AimFit.slope, targetPos ~= nil)
             if S.fishEsp and targetPos then
                 local scr, vis = WorldToScreen(targetPos)
                 targetRing.Visible = vis == true
