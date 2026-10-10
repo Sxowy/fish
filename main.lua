@@ -14,7 +14,28 @@ local myLoad = _G.DeepFishLoadId
 
 local function main()
 
-local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))() or INSUI
+-- The menu library, patched so an error inside one of its frames can't end
+-- its loop (that froze the menu and blocked game input). Our copy comes from
+-- this PC when present, else this repo, else the original as a last resort.
+local function loadLib()
+    local sources = {
+        function() return isfile and isfile("deepfish/uilib.lua") and readfile("deepfish/uilib.lua") end,
+        function() return game:HttpGet("https://raw.githubusercontent.com/Sxowy/fish/main/uilib.lua") end,
+        function() return game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua") end,
+    }
+    for _, get in ipairs(sources) do
+        local ok, src = pcall(get)
+        if ok and type(src) == "string" and #src > 100000 then
+            local fn = loadstring(src)
+            if fn then
+                local okRun, lib = pcall(fn)
+                if okRun then return lib or INSUI end
+            end
+        end
+    end
+    return INSUI
+end
+local Lib = loadLib()
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
