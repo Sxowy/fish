@@ -793,6 +793,7 @@ local Steer = {
     manualUntil = 0,
 }
 local STEER_DEADZONE = 6
+local FISH_MAGNET = 1.5     -- the game's CatchBandScale with Fish Magnet on (default)
 local MAX_OFFSET = 48       -- game caps the offset at 50 studs
 local POINTER_LIMIT = 0.94  -- keep the cursor off the very edge
 local SWITCH_RATIO = 1.5    -- a new fish must be worth this much more to switch
@@ -1822,7 +1823,11 @@ local function renderStep(dt)
                     -- already hooked and dodging it does nothing
                     local gap = pos.Y - baitPos.Y
                     if gap > -0.5 and gap < limit then
-                        hazards[#hazards + 1] = { lat = pos:Dot(axis), r = f.halfWidth + pad, gap = gap }
+                        -- The game grabs anything whose catch box the bait enters,
+                        -- and with its Fish Magnet setting (on by default) that box
+                        -- is 1.5x the fish's size, longest along its body, and fish
+                        -- swim sideways. Dodging the plain hitbox passed far too close.
+                        hazards[#hazards + 1] = { lat = pos:Dot(axis), r = f.halfWidth * FISH_MAGNET + pad, gap = gap }
                     end
                 end
             end
