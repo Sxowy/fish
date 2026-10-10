@@ -1887,8 +1887,29 @@ local function renderStep(dt)
         local hazards = {}
         local rise = math.max(Cast.rise or 10, 2)
         local window = rise * 1.2
-        -- with a target, only fish the bait meets before it
-        local limit = targetPos and math.min(window, (Steer.targetGap or window) - 1) or window
+        -- with a target, only fish the bait meets before it or beside it.
+        -- Once the bait is level with it (the hook takes ~0.4s to register)
+        -- look past it again: the bait keeps rising, and that stretch went
+        -- undodged
+        local limit = window
+        local tg = Steer.targetGap
+        if targetPos and tg then
+            if tg > 1 then
+                limit = math.min(window, tg + 0.5)
+            elseif tg > -0.4 then
+                limit = 0.5
+            end
+        end
+        -- final approach: leaving the target's hitbox means missing it.
+        -- Inside it the dodge may pick the side away from junk; a valuable
+        -- fish is never given up to avoid a cheap one
+        local missCost, tLo, tHi = 0, nil, nil
+        if targetPos and target and not idleLane and tg and tg > -0.4 and tg / rise < 0.6 then
+            local hw = (target.halfWidth or 1.25) * 0.8
+            tLo, tHi = goalLat - hw, goalLat + hw
+            local big = (target.price or 0) >= 20000 or (target.worth or 0) >= ITEM_PRIORITY
+            missCost = big and 500 or 60
+        end
         local pad = 1.5
         local now = os.clock()
         Steer.fishVel = Steer.fishVel or {}
@@ -1926,6 +1947,7 @@ local function renderStep(dt)
             local bestX, bestCost = goalLat, math.huge
             for x = Steer.landing - lim, Steer.landing + lim, 0.5 do
                 local cost = math.abs(x - want) * pull + math.abs(x - here) * 0.02
+                if tLo and (x < tLo or x > tHi) then cost = cost + missCost end
                 for _, h in ipairs(hazards) do
                     local urgency = 1 / (0.15 + h.eta)
                     local overlap = h.r - math.abs(x - h.lat)
