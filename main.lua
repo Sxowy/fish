@@ -21,7 +21,12 @@ do
     local CARD_W, CARD_H, PAD = 440, 196, 26
     local Z = 300
     local items, conn = {}, nil
-    local st = { target = 0, shown = 0, text = "Starting", alpha = 0, phase = "off", closeAt = nil, err = nil }
+    -- The script loads in a second or two, too fast to read. The bar is
+    -- paced to fill over at least MIN_SHOW seconds (a slower load just
+    -- follows the real progress), and each step's text shows as the bar
+    -- reaches it.
+    local MIN_SHOW = 3.2
+    local st = { target = 0, shown = 0, alpha = 0, phase = "off", closeAt = nil, err = nil, startAt = 0, steps = {}, ready = false }
 
     local function add(kind, props, layer)
         local ok, d = pcall(Drawing.new, kind)
@@ -82,8 +87,17 @@ do
         end
         if st.closeAt and now >= st.closeAt and st.phase ~= "out" then st.phase = "out" end
 
-        -- the bar eases toward the last reported step
-        st.shown = st.shown + (st.target - st.shown) * math.min(1, dt * 5)
+        -- the bar eases toward the last reported step, no faster than the pace
+        local pace = math.clamp((now - st.startAt) / (MIN_SHOW - 0.8), 0, 1)
+        local goal = math.min(st.target, pace)
+        st.shown = st.shown + (goal - st.shown) * math.min(1, dt * 6)
+        -- the text of the furthest step the bar has reached
+        local label = st.steps[1] and st.steps[1].text or "Starting"
+        for _, sp in ipairs(st.steps) do
+            if sp.pct <= st.shown + 0.02 then label = sp.text end
+        end
+        -- finished and the bar is full: hold a moment on "Ready", then fade
+        if st.ready and not st.closeAt and st.shown >= 0.985 then st.closeAt = now + 0.7 end
 
         -- slides up a little while fading in
         local y = y0 + (1 - st.alpha) * 12
@@ -112,7 +126,8 @@ do
         -- status, percent, bar
         local barY = y + CARD_H - 58
         local barW = CARD_W - PAD * 2
-        status.Text = st.err and ("Failed: " .. st.err) or (st.text .. string.rep(".", math.floor(now * 2.5) % 4))
+        status.Text = st.err and ("Failed: " .. st.err)
+            or (label == "Ready" and "Ready" or (label .. string.rep(".", math.floor(now * 2.5) % 4)))
         status.Color = st.err and Color3.fromRGB(255, 110, 110) or TEXT
         status.Position = Vector2.new(x0 + PAD, barY - 24)
         pctText.Text = string.format("%d%%", math.floor(st.shown * 100 + 0.5))
@@ -149,21 +164,22 @@ do
     function Splash.start()
         if conn then return end
         if not pcall(build) then Splash.remove() return end
-        st.phase, st.alpha = "in", 0
+        st.phase, st.alpha, st.startAt = "in", 0, os.clock()
         conn = RunService.RenderStepped:Connect(function(dt) pcall(frame, dt) end)
         -- never left on screen
         task.delay(30, function() if conn then Splash.remove() end end)
     end
 
     function Splash.step(text, pct)
-        st.text = text or st.text
-        st.target = math.max(st.target, math.clamp(pct or st.target, 0, 1))
+        pct = math.clamp(pct or st.target, 0, 1)
+        st.steps[#st.steps + 1] = { text = text or "Loading", pct = pct }
+        st.target = math.max(st.target, pct)
         pcall(task.wait)
     end
 
     function Splash.done()
-        st.text, st.target = "Ready", 1
-        st.closeAt = os.clock() + 0.8
+        st.steps[#st.steps + 1] = { text = "Ready", pct = 1 }
+        st.target, st.ready = 1, true
     end
 
     function Splash.fail(msg)
