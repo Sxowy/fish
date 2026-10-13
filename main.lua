@@ -528,14 +528,29 @@ end
 -- session stats
 ---------------------------------------------------------------------------
 
-local Stats = {
-    start = os.clock(),
-    casts = 0, perfects = 0, catches = 0, fights = 0, fightsWon = 0,
-    earned = 0, spent = 0, caughtValue = 0,
-    byRarity = {},
-    best = nil, bestValue = 0,
-    lastCash = nil,
-}
+-- Session stats live in _G so re-executing the script (an update, a fix)
+-- doesn't zero them; a different server starts a new session
+local okJob, jobId = pcall(function() return game.JobId end)
+jobId = okJob and jobId or "?"
+local function newStats()
+    return {
+        jobId = jobId,
+        start = os.clock(),
+        casts = 0, perfects = 0, catches = 0, fights = 0, fightsWon = 0,
+        earned = 0, spent = 0, caughtValue = 0,
+        byRarity = {},
+        best = nil, bestValue = 0,
+        lastCash = nil,
+        castCatches = 0, castValue = 0, lastCast = nil,
+    }
+end
+local Stats = _G.DeepFishStats
+if type(Stats) ~= "table" or Stats.jobId ~= jobId then
+    Stats = newStats()
+    _G.DeepFishStats = Stats
+end
+Stats.castCatches = Stats.castCatches or 0
+Stats.castValue = Stats.castValue or 0
 
 local CatchLog = {}       -- newest first, capped
 local CATCH_LOG_MAX = 100
@@ -585,6 +600,8 @@ local function recordCatch(name, rarity, value)
     Stats.catches = Stats.catches + 1
     Stats.byRarity[rarity] = (Stats.byRarity[rarity] or 0) + 1
     Stats.caughtValue = Stats.caughtValue + value
+    Stats.castCatches = Stats.castCatches + 1
+    Stats.castValue = Stats.castValue + value
     logCatch(name, rarity, "", "", value)
     if value > 0 and value >= Stats.bestValue then
         Stats.bestValue = value
@@ -646,7 +663,6 @@ local function doCast()
     mouse1release()
     Cast.lastRelease = os.clock()
     Cast.lastActive = os.clock()
-    Stats.casts = Stats.casts + 1
 end
 
 ---------------------------------------------------------------------------
@@ -1927,6 +1943,12 @@ task.spawn(function()
             -- count a new cast, however quickly the next throw follows.
             if d == 0 and Cast.wasDeep then
                 Cast.castNo = (Cast.castNo or 0) + 1
+                -- every cast counts, the game's auto fishing included
+                Stats.casts = Stats.casts + 1
+                if Stats.castCatches > 0 then
+                    Stats.lastCast = { n = Stats.castCatches, value = Stats.castValue }
+                end
+                Stats.castCatches, Stats.castValue = 0, 0
                 AimMem.aim, AimMem.ptr = nil, nil
             end
             Cast.wasDeep = d > 0
@@ -2613,7 +2635,7 @@ sStats:Label(function() return string.format("Fights won: %d / %d", Stats.fights
 sStats:Label(function() return "Earned: " .. fmtMoney(Stats.earned) .. "   Spent: " .. fmtMoney(Stats.spent) end)
 sStats:Label(function()
     local h = math.max((os.clock() - Stats.start) / 3600, 1 / 3600)
-    return string.format("Per hour: %s   %d fish", fmtMoney(Stats.earned / h), math.floor(Stats.catches / h))
+    return string.format("Per hour: %s   %d fish", fmtShort(Stats.caughtValue / h), math.floor(Stats.catches / h))
 end)
 sStats:Label(function() return "Value caught: " .. fmtShort(Stats.caughtValue) end)
 sStats:Label(function() return "Best: " .. (Stats.best or "-") end)
@@ -2621,6 +2643,7 @@ sStats:Button("Reset session", function()
     Stats.start = os.clock()
     Stats.casts, Stats.catches, Stats.fights, Stats.fightsWon, Stats.earned, Stats.spent = 0, 0, 0, 0, 0, 0
     Stats.byRarity, Stats.best, Stats.bestValue, Stats.caughtValue = {}, nil, 0, 0
+    Stats.castCatches, Stats.castValue, Stats.lastCast = 0, 0, nil
 end)
 
 local sLog = tInfo:Section("Recent catches", "Left")
@@ -2764,7 +2787,7 @@ win:AddSettingsTab("gear")
 -- box is painted by the library's own frame loop, so whenever that loop
 -- stopped, the box froze on whatever it last showed. These drawings are
 -- created once and rewritten twice a second by a loop of ours.
-local BOX_X, BOX_Y, BOX_W = 20, 160, 230
+local BOX_X, BOX_Y, BOX_W = 20, 160, 265
 local BOX_ROW, BOX_PAD = 18, 8
 local function onOff(v) return v and "ON" or "off" end
 local boxRows = {
@@ -2797,13 +2820,23 @@ local boxRows = {
             local rec = f.id and Paths.fish[f.id]
             if rec and rec.good then known = known + 1 end
         end
-        return string.format("Paths known: %d / %d fish", known, #School)
+        return string.format("Fish paths read: %d / %d", known, #School)
     end,
     function() return "Event: " .. (txt(R.event) or "?") end,
-    function() return "Catches: " .. tostring(Stats.catches) end,
     function()
-        local h = math.max((os.clock() - Stats.start) / 3600, 1 / 3600)
-        return "Per hour: " .. fmtMoney(Stats.earned / h)
+        return string.format("Session: %s  %d fish  %s", fmtTime(os.clock() - Stats.start), Stats.catches, fmtShort(Stats.caughtValue))
+    end,
+    function()
+        -- what the fish caught are worth per hour (their sell value), so it
+        -- doesn't wait for a trip to the shop
+        local secs = os.clock() - Stats.start
+        if secs < 60 or Stats.catches == 0 then return "Per hour: measuring..." end
+        return "Per hour: " .. fmtShort(Stats.caughtValue / (secs / 3600)), Color3.fromRGB(140, 230, 140)
+    end,
+    function()
+        local c = Stats.lastCast
+        if not c then return "Last cast: -" end
+        return string.format("Last cast: %d fish, %s", c.n, fmtShort(c.value))
     end,
     function() return "Best: " .. (Stats.best or "-") end,
 }
