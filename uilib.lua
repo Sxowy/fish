@@ -6922,7 +6922,11 @@ end
 -- Deep Fishing patch: the frame runs inside pcall. Unpatched, one error
 -- anywhere in a frame ended this loop for good: the menu froze on screen and,
 -- if it was holding game input back, the game stopped responding.
-task.spawn(function()
+-- Second patch: frames are driven by RenderStepped, not a task.wait loop.
+-- Waiting threads in Matcha can stall for seconds (or stop) while a memory
+-- scan runs, and the menu froze with them; a render callback is simply
+-- called again on the next frame.
+do
   local function Frame()
     if _G[LibName .. "Instance"] ~= Instance then
       InsUi:Destroy()
@@ -7023,19 +7027,31 @@ task.spawn(function()
 
   end
 
-  while State.Alive do
+  local NextAt, Conn = 0, nil
+  Conn = game:GetService("RunService").RenderStepped:Connect(function()
+    if not State.Alive then
+      if Conn then Conn:Disconnect() end
+      return
+    end
+    local Now = os.clock()
+    if Now < NextAt then return end
+
     local Ok, Result = pcall(Frame)
 
-    if Ok and Result == "stop" then return end
+    if Ok and Result == "stop" then
+      if Conn then Conn:Disconnect() end
+      return
+    end
 
     if not Ok then
       warn("[INSUI] frame error (recovered): " .. tostring(Result))
       pcall(HideUnused)
     end
 
-    task.wait(Ok and FrameDelay() or 0.05)
-  end
-end)
+    local OkD, Delay = pcall(FrameDelay)
+    NextAt = Now + ((Ok and OkD and type(Delay) == "number") and Delay or 0.05)
+  end)
+end
 
 for _, Key in ipairs({ LibName, LibName .. "UI", "INSUI" }) do _G[Key] = InsUi end
 

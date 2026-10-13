@@ -927,19 +927,25 @@ end
 -- most one search per cast, and a long pause after a failed one.
 local AIM_ANCHORS = { "ThrowDistance" }
 
--- every match for a field: live table and dead copies alike
-local function scanAll(field)
-    local out = {}
+-- Both fields in ONE scan. A scan stops every script in Matcha while it
+-- walks the game's memory (menu, status box and steering included): two
+-- scans per search, plus rescues, froze everything for 2-4.5s at a time.
+-- Asking for both keys at once takes under a second and also skips the dead
+-- copies that only matched one field.
+local function scanAim()
+    local aims, ptrs = {}, {}
     for _, anchor in ipairs(AIM_ANCHORS) do
-        local ok, res = pcall(findgc, anchor, { [field] = "number" })
+        local ok, res = pcall(findgc, anchor, { AimOffset = "number", AimPointer = "number" })
         if ok and type(res) == "table" then
             for _, e in ipairs(res) do
-                if tostring(e.key) == field and e.addr then out[#out + 1] = e.addr end
+                local k = tostring(e.key)
+                if e.addr and k == "AimOffset" then aims[#aims + 1] = e.addr end
+                if e.addr and k == "AimPointer" then ptrs[#ptrs + 1] = e.addr end
             end
         end
-        if #out > 0 then break end
+        if #ptrs > 0 then break end
     end
-    return out
+    return aims, ptrs
 end
 
 function AimMem.locate()
@@ -964,8 +970,7 @@ function AimMem.locate()
         -- while dead copies hold whatever was last written into them. So pair
         -- each pointer with the AimOffset stored next to it (same node array,
         -- within 32 KB) and keep the pair whose pointer matches the mouse.
-        local aims = scanAll("AimOffset")
-        local ptrs = #aims > 0 and scanAll("AimPointer") or {}
+        local aims, ptrs = scanAim()
         local vp = camera.ViewportSize
         local mousePtr = math.clamp(mouse.X / math.max(vp.X, 1) * 2 - 1, -1, 1)
         -- mid-cast rescue: the live pointer holds what we last wrote, not the
@@ -1553,6 +1558,9 @@ task.spawn(function()
                         if moved or (rec.fresh or 0) >= 6 or (rec.c == nil and #rec.s >= 8) then
                             rec.fresh = 0
                             fitFish(rec)
+                            -- one fish per frame: a full refit never stalls
+                            -- the box, the menu or the steering
+                            task.wait()
                         end
                     end
                 end
@@ -2856,59 +2864,82 @@ end):SetRisk()
 
 win:AddSettingsTab("gear")
 
--- The status box is drawn by this script, not the menu library. A library
--- box is painted by the library's own frame loop, so whenever that loop
--- stopped, the box froze on whatever it last showed. These drawings are
--- created once and rewritten twice a second by a loop of ours.
-local BOX_X, BOX_Y, BOX_W = 20, 160, 265
+-- Status box. Drawn by this script with plain Drawing objects (no menu
+-- library involved) and refreshed from a render-frame callback, the same way
+-- the steering runs, ten times a second. A timer thread used to drive it,
+-- and when that thread stalled the box sat on old numbers while everything
+-- else carried on.
+local BOX_X, BOX_Y, BOX_W = 20, 160, 280
 local BOX_ROW, BOX_PAD = 18, 8
+local C_TEXT = Color3.fromRGB(222, 224, 232)
+local C_DIM = Color3.fromRGB(150, 152, 165)
+local C_GOOD = Color3.fromRGB(130, 230, 140)
+local C_WARN = Color3.fromRGB(255, 200, 90)
+local C_BAD = Color3.fromRGB(255, 120, 120)
 local function onOff(v) return v and "ON" or "off" end
+
+-- what the cast is doing right now
+local function castStatus()
+    if S.staffGuard and Guard.staff then return "Paused: staff in server", C_BAD end
+    if Cast.fighting then return "Fighting a fish", C_WARN end
+    local d = Cast.depth or 0
+    if d > 0 then return string.format("Fishing  %dm deep", d), C_GOOD end
+    if S.autoCast and menuOpen() then return "Close the menu so auto cast can click", C_WARN end
+    if S.autoCast then return "Waiting to cast", C_DIM end
+    return "Idle (auto cast off)", C_DIM
+end
+
 local boxRows = {
+    castStatus,
     function()
-        if S.staffGuard and Guard.staff then return "PAUSED - staff in server", Color3.fromRGB(255, 120, 120) end
-        if S.autoCast and menuOpen() then return "Close the menu so auto cast can click", Color3.fromRGB(255, 200, 90) end
-        return nil
-    end,
-    function() return "Auto cast: " .. onOff(S.autoCast) end,
-    function() return "Auto steer: " .. onOff(S.autoSteer) end,
-    function()
-        local r = Steer.route
-        if not (r and #r > 0) then return "Route: -" end
-        local money = 0
-        for _, f in ipairs(r) do money = money + (f.price or 0) end
-        return string.format("Route: %d fish, %s", #r, fmtShort(money))
+        return string.format("Auto cast: %s    Auto steer: %s", onOff(S.autoCast), onOff(S.autoSteer)), C_DIM
     end,
     function()
-        local t = Steer.target
-        return "Next: " .. (t and (t.name .. (t.price and ("  " .. fmtShort(t.price)) or "")) or "-")
-    end,
-    function()
+        if (Cast.depth or 0) <= 0 then return nil end
         local left, cap = slotsLeft()
-        return string.format("Slots: %d / %d free", left, cap)
+        return string.format("This cast: %d fish  %s   (%d/%d slots left)", Stats.castCatches, fmtShort(Stats.castValue), left, cap)
     end,
     function()
-        if (Cast.depth or 0) <= 0 or #School == 0 then return nil end
+        if (Cast.depth or 0) <= 0 then return nil end
+        local t = Steer.target
+        if not t then return "Next: -", C_DIM end
+        return "Next: " .. t.name .. (t.price and ("  " .. fmtShort(t.price)) or "")
+    end,
+    function()
+        if (Cast.depth or 0) <= 0 then return nil end
+        local r = Steer.route
         local known = 0
         for _, f in ipairs(School) do
             local rec = f.id and Paths.fish[f.id]
             if rec and rec.good then known = known + 1 end
         end
-        return string.format("Fish paths read: %d / %d", known, #School)
+        local plan = "-"
+        if r and #r > 0 then
+            local money = 0
+            for _, f in ipairs(r) do money = money + (f.price or 0) end
+            plan = string.format("%d fish %s", #r, fmtShort(money))
+        end
+        return string.format("Plan: %s   (paths %d/%d)", plan, known, #School), C_DIM
     end,
-    function() return "Event: " .. (txt(R.event) or "?") end,
     function()
-        return string.format("Session: %s  %d fish  %s", fmtTime(os.clock() - Stats.start), Stats.catches, fmtShort(Stats.caughtValue))
+        local e = txt(R.event)
+        if not e or e == "" then return nil end
+        return "Event: " .. e, C_DIM
+    end,
+    function() return " " end,
+    function()
+        return string.format("Session %s   %d fish   %s", fmtTime(os.clock() - Stats.start), Stats.catches, fmtShort(Stats.caughtValue))
     end,
     function()
-        -- what the fish caught are worth per hour (their sell value), so it
-        -- doesn't wait for a trip to the shop
+        -- sell value of what was caught, per hour, so it doesn't wait for a
+        -- trip to the shop
         local secs = os.clock() - Stats.start
-        if secs < 60 or Stats.catches == 0 then return "Per hour: measuring..." end
-        return "Per hour: " .. fmtShort(Stats.caughtValue / (secs / 3600)), Color3.fromRGB(140, 230, 140)
+        if secs < 60 or Stats.catches == 0 then return "Per hour: measuring...", C_DIM end
+        return "Per hour: " .. fmtShort(Stats.caughtValue / (secs / 3600)), C_GOOD
     end,
     function()
         local c = Stats.lastCast
-        if not c then return "Last cast: -" end
+        if not c then return "Last cast: -", C_DIM end
         return string.format("Last cast: %d fish, %s", c.n, fmtShort(c.value))
     end,
     function() return "Best: " .. (Stats.best or "-") end,
@@ -2916,55 +2947,87 @@ local boxRows = {
 
 local boxBg = Drawing.new("Square")
 boxBg.Filled = true
-boxBg.Color = Color3.fromRGB(18, 18, 22)
-boxBg.Transparency = 0.15
+boxBg.Color = Color3.fromRGB(16, 16, 20)
+boxBg.Transparency = 0.2
 boxBg.Position = Vector2.new(BOX_X, BOX_Y)
+boxBg.Size = Vector2.new(BOX_W, 40)
 boxBg.Visible = true
 Hub.drawings[#Hub.drawings + 1] = boxBg
+
+local boxEdge = Drawing.new("Square")
+boxEdge.Filled = false
+boxEdge.Thickness = 1
+boxEdge.Color = Color3.fromRGB(120, 110, 230)
+boxEdge.Position = Vector2.new(BOX_X, BOX_Y)
+boxEdge.Size = Vector2.new(BOX_W, 40)
+boxEdge.Visible = true
+Hub.drawings[#Hub.drawings + 1] = boxEdge
 
 local boxTitle = Drawing.new("Text")
 boxTitle.Text = "Deep Fishing"
 boxTitle.Size = 15
 boxTitle.Outline = true
-boxTitle.Color = Color3.fromRGB(160, 150, 255)
+boxTitle.Color = Color3.fromRGB(165, 155, 255)
 boxTitle.Position = Vector2.new(BOX_X + BOX_PAD, BOX_Y + 6)
 boxTitle.Visible = true
 Hub.drawings[#Hub.drawings + 1] = boxTitle
+
+-- blinks every refresh: if it stops, the script has stopped
+local boxPulse = Drawing.new("Circle")
+boxPulse.Radius = 4
+boxPulse.Filled = true
+boxPulse.NumSides = 12
+boxPulse.Color = C_GOOD
+boxPulse.Position = Vector2.new(BOX_X + BOX_W - 14, BOX_Y + 14)
+boxPulse.Visible = true
+Hub.drawings[#Hub.drawings + 1] = boxPulse
 
 local boxText = {}
 for i = 1, #boxRows do
     local t = Drawing.new("Text")
     t.Size = 13
     t.Outline = true
-    t.Color = Color3.fromRGB(220, 222, 230)
+    t.Color = C_TEXT
     t.Visible = false
     boxText[i] = t
     Hub.drawings[#Hub.drawings + 1] = t
 end
 
+local boxTick = 0
 local function drawBox()
-    local y = BOX_Y + 6 + BOX_ROW + 4
+    boxTick = boxTick + 1
+    boxPulse.Transparency = (boxTick % 10 < 5) and 1 or 0.35
+    local y = BOX_Y + 6 + BOX_ROW + 6
     for i, row in ipairs(boxRows) do
         local ok, text, color = pcall(row)
         local t = boxText[i]
         if ok and text then
-            t.Text = tostring(text)
-            t.Color = color or Color3.fromRGB(220, 222, 230)
-            t.Position = Vector2.new(BOX_X + BOX_PAD, y)
-            t.Visible = true
-            y = y + BOX_ROW
+            if text == " " then
+                y = y + 6 -- spacer
+                t.Visible = false
+            else
+                t.Text = tostring(text)
+                t.Color = color or C_TEXT
+                t.Position = Vector2.new(BOX_X + BOX_PAD, y)
+                t.Visible = true
+                y = y + BOX_ROW
+            end
         else
             t.Visible = false
         end
     end
-    boxBg.Size = Vector2.new(BOX_W, y - BOX_Y + 4)
+    local size = Vector2.new(BOX_W, y - BOX_Y + 6)
+    boxBg.Size = size
+    boxEdge.Size = size
 end
 
-task.spawn(function()
-    while Hub.running do
-        pcall(drawBox)
-        task.wait(0.5)
-    end
+local lastBoxDraw = 0
+Hub.conns[#Hub.conns + 1] = RunService.RenderStepped:Connect(function()
+    if not Hub.running then return end
+    local now = os.clock()
+    if now - lastBoxDraw < 0.1 then return end
+    lastBoxDraw = now
+    pcall(drawBox)
 end)
 
 -- Never call Lib:Destroy() directly: it frees drawings the menu may still be
