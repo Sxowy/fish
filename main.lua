@@ -70,6 +70,9 @@ local S = {
     steerSpeed = 4,
     steerMode = "Direct", -- the only steering mode
     snipe = false, -- Exploits tab: park outside the fish and jump onto targets (see renderStep)
+    autoSell = false, -- Pro mode only (Matcha Hybrid Mode)
+    sellEvery = 1,    -- casts between sells
+    sellKeep = "Sell all",
     goForItems = true,
     targetMode = "Value",
     minValue = 0, -- 0 = Auto: no fixed floor, the planner keeps the best fish for the slots
@@ -1821,6 +1824,127 @@ local function inventoryFull()
     return used ~= nil and cap ~= nil and cap > 0 and used >= cap
 end
 
+---------------------------------------------------------------------------
+-- Pro mode: features that send something to the game's server. Matcha can
+-- only do that in Hybrid Mode (a Matcha Pro feature), so it's checked once
+-- at start. Without it the script runs in Normal mode and those features
+-- stay off; everything else works the same.
+---------------------------------------------------------------------------
+
+local Pro = { hybrid = false, how = "not checked" }
+
+-- the game's network library (Warp) and its channels
+local function warpEvent()
+    local ok, ev = pcall(function()
+        return game:GetService("ReplicatedStorage").Shared.Vendors.Warp.Index.Event
+    end)
+    return ok and ev or nil
+end
+
+function Pro.detect()
+    -- a flag Matcha may expose itself
+    local okEnv, env = pcall(function() return getfenv(1) end)
+    env = okEnv and env or _G
+    for _, name in ipairs({ "ishybrid", "isHybrid", "is_hybrid", "ishybridmode", "hybridmode", "gethybrid", "getHybrid" }) do
+        local v = env[name]
+        if type(v) == "function" then
+            local ok, r = pcall(v)
+            if ok and type(r) == "boolean" then
+                Pro.hybrid, Pro.how = r, name .. "()"
+                return r
+            end
+        elseif type(v) == "boolean" then
+            Pro.hybrid, Pro.how = v, name
+            return v
+        end
+    end
+    -- Otherwise send nothing and see if it goes: an empty message on the
+    -- game's unreliable channel. The game's network code only reads
+    -- messages carrying its packet buffers, so an empty one is ignored.
+    -- Without Hybrid Mode, Matcha doesn't send: FireServer returns false
+    -- (and prints "FireServer requires hybrid mode to be enabled").
+    local ev = warpEvent()
+    local ch = ev and ev:FindFirstChild("Unreliable")
+    if not ch then
+        Pro.how = "no channel to test with"
+        return false
+    end
+    local ok, res = pcall(function() return ch:FireServer() end)
+    Pro.hybrid = ok and res ~= false
+    Pro.how = Pro.hybrid and "test send went through" or "Hybrid Mode is off"
+    return Pro.hybrid
+end
+
+-- Warp numbers each request type; the numbers are attributes on its
+-- Reliable channel ("3" = "SellAll" when this was written)
+local function warpId(name)
+    local ev = warpEvent()
+    local rel = ev and ev:FindFirstChild("Reliable")
+    if not rel then return nil end
+    for i = 1, 255 do
+        local ok, v = pcall(function() return rel:GetAttribute(tostring(i)) end)
+        if ok and v == name then return i end
+    end
+end
+
+-- Sell every fish (or only those worth less than `under`) without going to
+-- the shop: the same request the shopkeeper's "sell all" sends. Locked
+-- fish are kept, like at the shop.
+function Pro.sellAll(under)
+    if not Pro.hybrid then return false, "needs Hybrid Mode" end
+    if type(buffer) ~= "table" or not buffer.fromstring then return false, "this Matcha has no buffer support" end
+    Pro.sellId = Pro.sellId or warpId("SellAll")
+    if not Pro.sellId then return false, "sell request not found" end
+    local ev = warpEvent()
+    local req = ev and ev:FindFirstChild("Request")
+    if not req then return false, "no request channel" end
+    local key = tostring(math.random(100000, 999999)) .. tostring(math.floor(os.clock() * 1000))
+    local ok, res = pcall(function()
+        return req:FireServer(buffer.fromstring(string.char(Pro.sellId)), "\1", { { key, { "Fish", under } } })
+    end)
+    if ok and res == false then return false, "Hybrid Mode is off" end
+    return ok, ok and "sent" or tostring(res)
+end
+
+local SELL_KEEP = { ["Sell all"] = nil, ["Keep $100K+"] = 1e5, ["Keep $1M+"] = 1e6, ["Keep $10M+"] = 1e7 }
+local SELL_KEEP_ORDER = { "Sell all", "Keep $100K+", "Keep $1M+", "Keep $10M+" }
+
+function Pro.sellNow()
+    local before = num(txt(R.cash))
+    local ok, msg = Pro.sellAll(SELL_KEEP[S.sellKeep])
+    Pro.lastSell = { at = os.clock(), ok = ok, msg = msg }
+    if ok then
+        task.delay(2.5, function()
+            local after = num(txt(R.cash))
+            if before and after and Pro.lastSell then Pro.lastSell.gain = after - before end
+        end)
+    end
+    return ok, msg
+end
+
+-- auto sell: once after every N casts (or when the bag is full), between
+-- casts only
+task.spawn(function()
+    local soldAt = -1
+    while Hub.running do
+        task.wait(1)
+        pcall(function()
+            if not (S.autoSell and Pro.hybrid) then return end
+            if (Cast.depth or 0) > 0 or Cast.fighting then return end
+            if Stats.casts == soldAt or Stats.casts == 0 then return end
+            local every = math.max(tonumber(S.sellEvery) or 1, 1)
+            if Stats.casts % every ~= 0 and not inventoryFull() then return end
+            soldAt = Stats.casts
+            Pro.sellNow()
+        end)
+    end
+end)
+
+task.spawn(function()
+    pcall(Pro.detect)
+    Pro.checked = true
+end)
+
 -- staff carry a Role attribute; it's empty for everyone else
 local function findStaff()
     for _, p in ipairs(Players:GetPlayers()) do
@@ -2849,6 +2973,37 @@ sSnipeInfo:Label(function() return "and jumps onto a planned fish only" end)
 sSnipeInfo:Label(function() return "while rising through its height." end)
 sSnipeInfo:Label(function() return "Junk and cheap fish are never touched." end)
 
+local sSell = tExp:Section("Auto sell (Pro)", "Left", "sells without walking to the shop")
+sSell:Label(function()
+    if not Pro.checked then return "Checking Matcha mode..." end
+    if Pro.hybrid then return "Pro mode: Hybrid Mode is on" end
+    return "Normal mode: needs Matcha Hybrid Mode"
+end)
+UI.autoSell = sSell:Toggle("Auto sell", S.autoSell, function(on)
+    S.autoSell = on
+    if on and Pro.checked and not Pro.hybrid then
+        Lib:Notify("Auto sell", "Needs Matcha's Hybrid Mode (a Matcha Pro feature). Turn it on, then re-run the script.", 6, "warning")
+    end
+end, "sells your fish between casts")
+sSell:Dropdown("Keep", { S.sellKeep }, SELL_KEEP_ORDER, false, function(v)
+    S.sellKeep = (type(v) == "table" and v[1]) or v or "Sell all"
+end, "fish worth at least this are kept; locked fish are always kept")
+sSell:Dropdown("Sell every", { tostring(S.sellEvery) .. " casts" }, { "1 casts", "2 casts", "3 casts", "5 casts", "10 casts" }, false, function(v)
+    v = (type(v) == "table" and v[1]) or v or "1"
+    S.sellEvery = tonumber(tostring(v):match("%d+")) or 1
+end, "or sooner, when your bag is full")
+sSell:Button("Sell now", safe(function()
+    local ok, msg = Pro.sellNow()
+    Lib:Notify("Sell", ok and "Sell request sent" or ("Not sold: " .. tostring(msg)), 4, ok and "success" or "warning")
+end))
+sSell:Label(function()
+    local l = Pro.lastSell
+    if not l then return "Last sell: -" end
+    local ago = math.floor(os.clock() - l.at)
+    if not l.ok then return "Last sell failed: " .. tostring(l.msg) end
+    return string.format("Last sell: %s, %ds ago", l.gain and ("+" .. fmtShort(l.gain)) or "sent", ago)
+end)
+
 Lib:Category("INFO")
 local tInfo = win:Tab("Session", "gauge")
 
@@ -3035,7 +3190,8 @@ end
 local boxRows = {
     castStatus,
     function()
-        return string.format("Auto cast: %s    Auto steer: %s", onOff(S.autoCast), onOff(S.autoSteer)), C_DIM
+        local mode = not Pro.checked and "" or (Pro.hybrid and "   [Pro]" or "   [Normal]")
+        return string.format("Auto cast: %s    Auto steer: %s%s", onOff(S.autoCast), onOff(S.autoSteer), mode), C_DIM
     end,
     function()
         if (Cast.depth or 0) <= 0 then return nil end
@@ -3201,7 +3357,7 @@ end
 
 Hub.debug = {
     S = S, R = R, Odds = Odds, Stats = Stats, Cast = Cast, Steer = Steer, Guard = Guard, CatchLog = CatchLog,
-    AimMem = AimMem, AimFit = AimFit, Paths = Paths, predictPos = predictPos,
+    AimMem = AimMem, AimFit = AimFit, Paths = Paths, predictPos = predictPos, Pro = Pro,
     Bait = function() return MyBait end,
     School = function() return School end, holdTime = holdTime,
     rodSlotKey = rodSlotKey, inventoryFull = inventoryFull, findStaff = findStaff, validWebhook = validWebhook,
@@ -3209,6 +3365,14 @@ Hub.debug = {
 
 local fishKnown = 0 for _ in pairs(Price) do fishKnown = fishKnown + 1 end
 Lib:Notify("Deep Fishing", "Loaded - P opens the menu, F6 toggles auto cast. " .. fishKnown .. " fish priced.", 6, "success")
+task.delay(1.5, function()
+    if not Hub.running then return end
+    if Pro.hybrid then
+        Lib:Notify("Pro mode", "Matcha Hybrid Mode found: auto sell is available (Exploits tab).", 6, "success")
+    else
+        Lib:Notify("Normal mode", "Matcha Hybrid Mode is off: everything runs except auto sell.", 6, "info")
+    end
+end)
 
 end -- main
 
