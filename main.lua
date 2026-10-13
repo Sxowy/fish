@@ -1,6 +1,3 @@
--- Deep Fishing hub for Matcha, UI by INSUI
--- loadstring(game:HttpGet("https://raw.githubusercontent.com/Sxowy/fish/main/main.lua"))()
-
 -- Startup is serialized. Two copies starting at once both load the menu
 -- library and draw at the same time while one tears itself down, which has
 -- crashed Matcha; two copies running both steer the same bait. So:
