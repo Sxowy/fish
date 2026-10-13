@@ -28,3 +28,4 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/Sxowy/fish/main/main.
 - Automation only runs while the menu is closed and Roblox is the focused window. The menu holds game input back while it is open.
 - If throws keep landing Good instead of Perfect, adjust **Timing offset**: raise it if the throws are early, lower it if they are late.
 - Running it again unloads the previous copy first.
+- AutoSell currently doesnt work. Im working on seeing if im able to get that working without having to buy the gamepass
