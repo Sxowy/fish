@@ -81,6 +81,36 @@ local S = {
     antiAfk = true,
 }
 
+-- Settings are saved to a file and read back on every start, so an update
+-- or a re-execute doesn't turn auto cast (or anything else) back off.
+-- Only known keys with the same type are taken from the file.
+local SETTINGS_FILE = "deepfish/settings.json"
+do
+    local Http = game:GetService("HttpService")
+    local ok, saved = pcall(function()
+        return isfile(SETTINGS_FILE) and Http:JSONDecode(readfile(SETTINGS_FILE))
+    end)
+    if ok and type(saved) == "table" then
+        for k, v in pairs(saved) do
+            if S[k] ~= nil and type(S[k]) == type(v) and k ~= "steerMode" then S[k] = v end
+        end
+    end
+    local function encode()
+        local okE, s = pcall(function() return Http:JSONEncode(S) end)
+        return okE and s or nil
+    end
+    local last = encode()
+    task.spawn(function()
+        while Hub.running do
+            task.wait(2)
+            local now = encode()
+            if now and now ~= last then
+                if pcall(writefile, SETTINGS_FILE, now) then last = now end
+            end
+        end
+    end)
+end
+
 ---------------------------------------------------------------------------
 -- helpers
 ---------------------------------------------------------------------------
