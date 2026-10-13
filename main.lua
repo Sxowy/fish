@@ -873,7 +873,9 @@ end
 -- Labels alone aren't enough: freed memory keeps its labels for a while,
 -- and once it's reused the "AimOffset" there read as a 220-digit number.
 -- Writing into reused memory could crash the game, so the values must be
--- sane too (the game caps AimOffset at 50, AimPointer is -1..1).
+-- sane too (the game caps AimOffset at 50; AimPointer is -1..1 from the
+-- mouse, and up to PTR_SANE when we steer past the screen edge).
+local PTR_SANE = 2.2
 local function saneNum(addr, limit)
     local ok, v = pcall(memory_read, "double", addr)
     return ok and type(v) == "number" and v == v and math.abs(v) <= limit
@@ -881,7 +883,7 @@ end
 
 function AimMem.valid()
     return slotIs(AimMem.aim, "AimOffset", "number") and slotIs(AimMem.ptr, "AimPointer", "number")
-        and saneNum(AimMem.aim, 60) and saneNum(AimMem.ptr, 1.5)
+        and saneNum(AimMem.aim, 60) and saneNum(AimMem.ptr, PTR_SANE)
 end
 
 -- Find AimOffset and AimPointer with Matcha's own scan, one field each.
@@ -943,7 +945,7 @@ function AimMem.locate()
         for _, p in ipairs(ptrs) do
             local okV, v = pcall(memory_read, "double", p)
             -- skip copies whose memory has been reused (garbage values)
-            if okV and type(v) == "number" and v == v and math.abs(v) <= 1.5 then
+            if okV and type(v) == "number" and v == v and math.abs(v) <= PTR_SANE then
                 local nearA, nearD = nil, 32768
                 for _, a in ipairs(aims) do
                     local d = math.abs(a - p)
@@ -1028,6 +1030,18 @@ end
 -- nothing is locked, so there is nothing to hand back
 function AimMem.release()
     AimMem.held = false
+end
+
+-- Hand the pointer back inside the screen. Past the edge is only for
+-- steering during a cast; left there, the next throw started with the
+-- pointer off screen and the slot search took the live table for garbage.
+function AimMem.settle()
+    if AimMem.ptr and AimMem.valid() then
+        local v = readNum(AimMem.ptr)
+        if v and math.abs(v) > 1 then
+            pcall(memory_write, "double", AimMem.ptr, math.clamp(v, -1, 1))
+        end
+    end
 end
 
 -- Where the bait's base is and which way AimOffset pushes it.
@@ -1527,6 +1541,33 @@ local function predictPos(f, tAbs)
     return Vector3.new(Paths.ox + Paths.ax * a - Paths.az * Paths.perp, rec.y, Paths.oz + Paths.az * a + Paths.ax * Paths.perp)
 end
 
+-- Where the bait is allowed to go sideways, along the camera axis. Every
+-- fish turns around 20 studs either side of the school's center, so there
+-- is nothing to catch or dodge past that: going further only sent the bait
+-- off screen into empty water (the dodge found it "clear") and left it a
+-- long way back. Before the paths are read, stay on screen.
+local BAND_MARGIN = 2
+local function laneLimits(axis, half)
+    local lo = (Steer.landing or 0) - MAX_OFFSET
+    local hi = (Steer.landing or 0) + MAX_OFFSET
+    if Paths.center and Paths.ax and MyBait then
+        local okB, bp = pcall(function() return MyBait.Position end)
+        local y = okB and bp and bp.Y or 0
+        local c = Vector3.new(Paths.ox + Paths.ax * Paths.center - Paths.az * Paths.perp, y,
+            Paths.oz + Paths.az * Paths.center + Paths.ax * Paths.perp)
+        local cl = c:Dot(axis)
+        local spread = PATH_HALF * math.abs(Paths.ax * axis.X + Paths.az * axis.Z) + BAND_MARGIN
+        lo, hi = math.max(lo, cl - spread), math.min(hi, cl + spread)
+        Steer.bandCenter = cl
+    elseif Steer.landing and half then
+        local edge = POINTER_LIMIT * half
+        lo, hi = math.max(lo, Steer.landing - edge), math.min(hi, Steer.landing + edge)
+        Steer.bandCenter = nil
+    end
+    if lo > hi then lo, hi = hi, lo end
+    return lo, hi
+end
+
 local function planRoute(baitPos, axis, half)
     local baitY, baitLat = baitPos.Y, baitPos:Dot(axis)
     local rise = math.max(Cast.rise or 10, 2)
@@ -1949,6 +1990,7 @@ task.spawn(function()
                     Stats.lastCast = { n = Stats.castCatches, value = Stats.castValue }
                 end
                 Stats.castCatches, Stats.castValue = 0, 0
+                AimMem.settle()
                 AimMem.aim, AimMem.ptr = nil, nil
             end
             Cast.wasDeep = d > 0
@@ -2215,7 +2257,8 @@ local function renderStep(dt)
         -- from there. Holding wherever the bait happened to be fed on itself
         -- (a dodge pushed it out, the hold kept it out, the next dodge pushed
         -- further) until the offset pinned at the cap.
-        goalLat = Steer.landing or baitPos:Dot(axis)
+        local blo, bhi = laneLimits(axis, half)
+        goalLat = (Steer.bandCenter and (blo + bhi) / 2) or Steer.landing or baitPos:Dot(axis)
         idleLane = true
     end
 
@@ -2306,13 +2349,13 @@ local function renderStep(dt)
             end
         end
         if #hazards > 0 then
-            local lim = MAX_OFFSET
+            local laneLo, laneHi = laneLimits(axis, half)
             local here = baitPos:Dot(axis)
             local want = goalLat
-            -- idle (nothing to chase): barely care where, mostly care clear
-            local pull = idleLane and 0.05 or 1
-            local bestX, bestCost = goalLat, math.huge
-            for x = Steer.landing - lim, Steer.landing + lim, 0.5 do
+            -- idle (nothing to chase): mostly care clear, a little where
+            local pull = idleLane and 0.15 or 1
+            local bestX, bestCost = math.clamp(goalLat, laneLo, laneHi), math.huge
+            for x = laneLo, laneHi, 0.5 do
                 local cost = math.abs(x - want) * pull + math.abs(x - here) * 0.02
                 if tLo and (x < tLo or x > tHi) then cost = cost + missCost end
                 for _, h in ipairs(hazards) do
@@ -2340,8 +2383,8 @@ local function renderStep(dt)
     -- a lead can overshoot past where the bait can go; hold it at the edge
     -- of reach instead of giving up on the fish
     if goalLat and Steer.landing and half then
-        local lim = MAX_OFFSET
-        goalLat = math.clamp(goalLat, Steer.landing - lim, Steer.landing + lim)
+        local laneLo, laneHi = laneLimits(axis, half)
+        goalLat = math.clamp(goalLat, laneLo, laneHi)
     end
 
     -- Direct: write the offset that puts the bait at goalLat. Needs no
