@@ -757,6 +757,8 @@ local function collectSchool()
                         -- the game grabs when the bait is inside the hitbox,
                         -- padded to at least 1.25 studs a side
                         halfWidth = math.max(okSize and size and math.max(size.X, size.Z) / 2 or 1.25, 1.25),
+                        -- the bait is grabbed anywhere inside this height
+                        halfY = math.max(okSize and size and size.Y / 2 or 1.25, 1.25),
                         rarity = ItemNames[name] and "Item" or JunkNames[name] and "Junk" or fishRarity(name),
                         price = price,
                         realPrice = tagPrice ~= nil,
@@ -976,7 +978,13 @@ function AimMem.write(offset, half, sign, chasing)
         local miss = AimMem.lastWant - cur
         AimMem.corr = math.clamp((AimMem.corr or 0) + miss * 0.02, -15, 15)
     end
-    local want = math.clamp((offset + (AimMem.corr or 0)) / k, -1, 1)
+    -- Past the screen edge too: while the mouse is still the game reuses the
+    -- stored pointer without clamping it to the screen, and only caps the
+    -- resulting offset at 50 studs. The fish swing 20 studs either side of
+    -- a center that can sit ~10 studs off the bait's own, so the screen edge
+    -- (~25 studs) left the far side of every swing out of reach
+    local reach = MAX_OFFSET / math.abs(k)
+    local want = math.clamp((offset + (AimMem.corr or 0)) / k, -reach, reach)
     -- Dead memory looks valid (see the cast counter): if AimOffset hasn't
     -- budged for a second while we keep asking for different positions,
     -- drop the slots and allow one rescue search this cast
@@ -1075,12 +1083,9 @@ local function goalPointer(lat, half)
     if not Steer.landing then return nil end
     local offset = lat - Steer.landing
     if math.abs(offset) > MAX_OFFSET then return nil end
-    -- Direct steers through the game's mouse pointer, which only reaches the
-    -- screen edge: about half the screen's width at the bait (~25 studs), not
-    -- the game's 50-stud cap. Anything further looked reachable, pinned the
-    -- bait at the edge, and (items rank first) blocked the whole cast.
+    -- Direct writes the pointer past the screen edge (see AimMem.write), so
+    -- its reach is the game's own 50-stud cap
     if S.steerMode == "Direct" then
-        if half and math.abs(offset) > POINTER_LIMIT * half then return nil end
         return offset
     end
     local p = offset / half
@@ -1198,6 +1203,314 @@ local function fishVelocity(f, lat, now)
     return rec.v
 end
 
+---------------------------------------------------------------------------
+-- Fish paths. The whole school is spawned when the cast starts
+-- (FishSchool:Spawn) and every fish swims a fixed, repeating path: back and
+-- forth along the cast's swim axis, 20 studs either side of the landing
+-- spot, eased at the ends:
+--     lat(t) = center + 20 * (2 * smooth(tri((t - c) / d)) - 1)
+-- with tri the 0..1..0 triangle wave, smooth(s) = s*s*(3 - 2s), d its
+-- crossing time (1.5-2.6s, x1.6 for finds) and c its start. Fish more than
+-- 40 studs from the camera are not moved at all (their position is stale),
+-- so a fish's speed says nothing about where it will be. Instead each
+-- fish's c and d are solved from the stretches where it was seen moving,
+-- and its lane is then known for any moment of the cast.
+---------------------------------------------------------------------------
+
+local Paths = { fish = {}, n = 0 }
+local PATH_HALF = 20
+local PATH_MAX_SAMPLES = 200
+
+local function smoothstep(s) return s * s * (3 - 2 * s) end
+
+-- lane offset from the center at time t (relative to Paths.t0)
+local function pathLat(t, c, d)
+    local w = ((t - c) / d) % 2
+    local s = 1 - math.abs(1 - w)
+    return PATH_HALF * (2 * smoothstep(s) - 1)
+end
+
+function Paths.reset()
+    Paths.fish, Paths.n = {}, 0
+    Paths.t0 = nil
+    Paths.sxx, Paths.sxz, Paths.szz = 0, 0, 0
+    Paths.ax, Paths.az, Paths.center, Paths.perp = nil, nil, nil, nil
+    -- lanes are measured from a point inside the school: world coordinates
+    -- run to thousands, and a hair of axis error there moved every lane
+    Paths.ox, Paths.oz = nil, nil
+end
+Paths.reset()
+
+-- record every fish that moved since the last look (frozen ones didn't)
+function Paths.observe(now)
+    Paths.t0 = Paths.t0 or now
+    local t = now - Paths.t0
+    for _, f in ipairs(School) do
+        local key = f.id
+        local okP, p = pcall(function() return f.part.Position end)
+        if key and okP and p then
+            local rec = Paths.fish[key]
+            if not Paths.ox then Paths.ox, Paths.oz = p.X, p.Z end
+            if not rec then
+                rec = { s = {}, lx = p.X, ly = p.Y, lz = p.Z, y = p.Y }
+                Paths.fish[key] = rec
+                Paths.n = Paths.n + 1
+            else
+                local dx, dy, dz = p.X - rec.lx, p.Y - rec.ly, p.Z - rec.lz
+                local moved = math.abs(dx) > 1e-4 or math.abs(dy) > 1e-4 or math.abs(dz) > 1e-4
+                -- a jump is a fish that was frozen out of view snapping to
+                -- where its path has it now: a good sample, but not a step
+                -- of motion for the axis estimate
+                local jump = dx * dx + dz * dz > 4
+                if moved then
+                    local s = rec.s
+                    s[#s + 1] = { t, p.X - Paths.ox, p.Z - Paths.oz }
+                    if #s > PATH_MAX_SAMPLES then
+                        -- thin evenly: keeps the long baseline that pins d down
+                        local thin = {}
+                        for i = 1, #s, 2 do thin[#thin + 1] = s[i] end
+                        rec.s = thin
+                    end
+                    rec.fresh = (rec.fresh or 0) + 1
+                    if not jump then
+                        Paths.sxx = Paths.sxx + dx * dx
+                        Paths.sxz = Paths.sxz + dx * dz
+                        Paths.szz = Paths.szz + dz * dz
+                    end
+                    -- a fitted fish that leaves its path (hooked, fleeing)
+                    if rec.c and Paths.center then
+                        local lat = (p.X - Paths.ox) * Paths.ax + (p.Z - Paths.oz) * Paths.az - Paths.center
+                        if math.abs(pathLat(t, rec.c, rec.d) - lat) > 1.5 then rec.good = false end
+                    end
+                end
+                rec.lx, rec.ly, rec.lz = p.X, p.Y, p.Z
+                rec.y = p.Y
+            end
+        end
+    end
+end
+
+-- swim axis and center: the main direction fish move in, and the middle of
+-- the 40 studs they all span
+local function solveLine()
+    if Paths.sxx + Paths.szz < 1 then return false end
+    local ang = 0.5 * math.atan2(2 * Paths.sxz, Paths.sxx - Paths.szz)
+    local ax, az = math.cos(ang), math.sin(ang)
+    -- keep the axis pointing the same way so lanes don't flip sign, and
+    -- don't nudge it for tiny changes (each change means refitting all)
+    if Paths.ax then
+        if ax * Paths.ax + az * Paths.az < 0 then ax, az = -ax, -az end
+        if math.abs(ax * Paths.az - az * Paths.ax) < 0.004 then ax, az = Paths.ax, Paths.az end
+    end
+    -- The center is the middle of any fish seen swing end to end: exactly
+    -- 40 studs. Hooked fish get dragged past the ends, so only spans of 40
+    -- count, and the median of those (an error here shifts every lane)
+    local mids, perps = {}, {}
+    for _, rec in pairs(Paths.fish) do
+        if #rec.s >= 8 then
+            local lo, hi = math.huge, -math.huge
+            for _, s in ipairs(rec.s) do
+                local a = s[2] * ax + s[3] * az
+                if a < lo then lo = a end
+                if a > hi then hi = a end
+            end
+            local span = hi - lo
+            if span > 2 * PATH_HALF - 0.4 and span < 2 * PATH_HALF + 0.4 then
+                mids[#mids + 1] = (lo + hi) / 2
+                local s1 = rec.s[1]
+                perps[#perps + 1] = -s1[2] * az + s1[3] * ax
+            end
+        end
+    end
+    if #mids == 0 then
+        -- nobody seen end to end yet: right after the school spawns (no
+        -- fish hooked yet) the whole school together covers the 40 studs
+        local lo, hi = math.huge, -math.huge
+        for _, rec in pairs(Paths.fish) do
+            for _, s in ipairs(rec.s) do
+                if s[1] < 3 then
+                    local a = s[2] * ax + s[3] * az
+                    if a < lo then lo = a end
+                    if a > hi then hi = a end
+                end
+            end
+            local s1 = rec.s[1]
+            if s1 then perps[#perps + 1] = -s1[2] * az + s1[3] * ax end
+        end
+        if hi - lo < 2 * PATH_HALF - 1.5 or hi - lo > 2 * PATH_HALF + 0.5 or #perps == 0 then return false end
+        mids[1] = (lo + hi) / 2
+    end
+    table.sort(mids)
+    table.sort(perps)
+    Paths.ax, Paths.az = ax, az
+    Paths.center = mids[math.floor((#mids + 1) / 2)]
+    Paths.perp = perps[math.floor((#perps + 1) / 2)]
+    Paths.fullSpans = #mids
+    return true
+end
+
+-- c and d from one fish's samples: invert the easing to get the triangle
+-- wave back (linear in time), read d off the slope of each one-way run,
+-- then polish both on every sample (Gauss-Newton)
+local function fitFish(rec)
+    local s = rec.s
+    if #s < 8 or s[#s][1] - s[1][1] < 0.4 then return end
+    local n = #s
+    local ts, lats, tri = {}, {}, {}
+    for i = 1, n do
+        local lat = s[i][2] * Paths.ax + s[i][3] * Paths.az - Paths.center
+        ts[i], lats[i] = s[i][1], lat
+        local e = math.clamp((lat / PATH_HALF + 1) / 2, 0, 1)
+        tri[i] = 0.5 - math.sin(math.asin(1 - 2 * e) / 3)
+    end
+    -- one-way runs between turns
+    local inits = {}
+    local i = 1
+    while i < n do
+        local j = i
+        local dir = 0
+        while j < n do
+            local ds = tri[j + 1] - tri[j]
+            local sd = ds > 0 and 1 or (ds < 0 and -1 or 0)
+            if dir == 0 then dir = sd end
+            if sd ~= 0 and sd ~= dir then break end
+            if ts[j + 1] - ts[j] > 0.3 then break end -- a gap: frozen meanwhile
+            j = j + 1
+        end
+        -- regress the middle of the run (the ends are where easing hides it)
+        local sx, sy, sxx, sxy, m = 0, 0, 0, 0, 0
+        for k = i, j do
+            if tri[k] > 0.06 and tri[k] < 0.94 then
+                local t = ts[k] - ts[i]
+                sx, sy, sxx, sxy, m = sx + t, sy + tri[k], sxx + t * t, sxy + t * tri[k], m + 1
+            end
+        end
+        if m >= 4 then
+            local den = m * sxx - sx * sx
+            if den > 1e-9 then
+                local b = (m * sxy - sx * sy) / den
+                local a = (sy - b * sx) / m - b * ts[i]
+                if math.abs(b) > 0.2 and math.abs(b) < 0.75 then
+                    local d = 1 / math.abs(b)
+                    -- the run pins the phase at its middle; d is what's unsure
+                    local tm = (ts[i] + ts[j]) / 2
+                    local trm = math.clamp(a + b * tm, 0, 1)
+                    inits[#inits + 1] = { d = d, w = m, tm = tm, um = b > 0 and trm or 2 - trm }
+                end
+            end
+        end
+        i = math.max(j, i + 1)
+    end
+    if #inits == 0 and not rec.c then return end
+    table.sort(inits, function(p, q) return p.w > q.w end)
+
+    -- A short run gives d only roughly, and over a whole cast a small error
+    -- in d adds up to whole crossings. So try every d near the run's (phase
+    -- held at the run) against a spread of all samples, keep the best few,
+    -- then polish
+    local step = math.max(1, math.floor(n / 40))
+    local starts = {}
+    if rec.c then starts[#starts + 1] = { c = rec.c, d = rec.d } end
+    for k = 1, math.min(#inits, 2) do
+        local it = inits[k]
+        local bc, bd, be = nil, nil, math.huge
+        local dLo, dHi = math.max(1.3, it.d - 0.35), math.min(4.5, it.d + 0.35)
+        for d = dLo, dHi, 0.002 do
+            local c = it.tm - it.um * d
+            local e = 0
+            for q = 1, n, step do
+                local r = pathLat(ts[q], c, d) - lats[q]
+                e = e + r * r
+                if e > be then break end
+            end
+            if e < be then bc, bd, be = c, d, e end
+        end
+        if bc then starts[#starts + 1] = { c = bc, d = bd } end
+    end
+
+    local bestC, bestD, bestE = nil, nil, math.huge
+    for k = 1, #starts do
+        local c, d = starts[k].c, starts[k].d
+        for _ = 1, 8 do
+            local jcc, jcd, jdd, gc, gd = 0, 0, 0, 0, 0
+            for q = 1, n do
+                local u = (ts[q] - c) / d
+                local w = u % 2
+                local sgn = w < 1 and 1 or -1
+                local tr = 1 - math.abs(1 - w)
+                local r = PATH_HALF * (2 * smoothstep(tr) - 1) - lats[q]
+                local dm = 12 * PATH_HALF * tr * (1 - tr) * sgn -- d lat / d u
+                local jc, jd = -dm / d, -dm * u / d
+                jcc, jcd, jdd = jcc + jc * jc, jcd + jc * jd, jdd + jd * jd
+                gc, gd = gc + jc * r, gd + jd * r
+            end
+            jcc, jdd = jcc * 1.001 + 1e-6, jdd * 1.001 + 1e-6
+            local det = jcc * jdd - jcd * jcd
+            if math.abs(det) < 1e-12 then break end
+            local dc = -(jdd * gc - jcd * gd) / det
+            local dd = -(jcc * gd - jcd * gc) / det
+            c = c + math.clamp(dc, -0.2, 0.2)
+            d = math.clamp(d + math.clamp(dd, -0.1, 0.1), 1.3, 4.5)
+            if math.abs(dc) < 1e-5 and math.abs(dd) < 1e-6 then break end
+        end
+        local e = 0
+        for q = 1, n do
+            local r = pathLat(ts[q], c, d) - lats[q]
+            e = e + r * r
+        end
+        e = math.sqrt(e / n)
+        if e < bestE then bestC, bestD, bestE = c, d, e end
+    end
+    rec.c, rec.d, rec.rms = bestC, bestD, bestE
+    rec.span = ts[n] - ts[1]
+    rec.good = bestE < 0.35
+end
+
+-- watch the school ~30 times a second; a new cast is a new school
+task.spawn(function()
+    while Hub.running do
+        pcall(function()
+            if Paths.cast ~= Cast.castNo then
+                Paths.reset()
+                Paths.cast = Cast.castNo
+            end
+            if S.autoSteer and #School > 0 then Paths.observe(os.clock()) end
+        end)
+        task.wait(0.03)
+    end
+end)
+
+-- background: refit fish that got new samples
+task.spawn(function()
+    while Hub.running do
+        pcall(function()
+            if next(Paths.fish) then
+                if solveLine() then
+                    -- a better center moves every lane: refit them all
+                    local moved = not Paths.fitCenter or math.abs(Paths.center - Paths.fitCenter) > 0.05
+                    Paths.fitCenter = Paths.center
+                    for _, rec in pairs(Paths.fish) do
+                        if moved or (rec.fresh or 0) >= 6 or (rec.c == nil and #rec.s >= 8) then
+                            rec.fresh = 0
+                            fitFish(rec)
+                        end
+                    end
+                end
+            end
+        end)
+        task.wait(0.15)
+    end
+end)
+
+-- where fish f will be at absolute time tAbs (os.clock), or nil when its
+-- path isn't known
+local function predictPos(f, tAbs)
+    local rec = f.id and Paths.fish[f.id]
+    if not (rec and rec.good and Paths.center and Paths.t0) then return nil end
+    local a = Paths.center + pathLat(tAbs - Paths.t0, rec.c, rec.d)
+    return Vector3.new(Paths.ox + Paths.ax * a - Paths.az * Paths.perp, rec.y, Paths.oz + Paths.az * a + Paths.ax * Paths.perp)
+end
+
 local function planRoute(baitPos, axis, half)
     local baitY, baitLat = baitPos.Y, baitPos:Dot(axis)
     local rise = math.max(Cast.rise or 10, 2)
@@ -1216,12 +1529,19 @@ local function planRoute(baitPos, axis, half)
                     -- will be in when the bait reaches its height
                     local now = os.clock()
                     local eta = math.max(pos.Y - baitY, 0) / rise
-                    local lat = pos:Dot(axis) + fishVelocity(f, pos:Dot(axis), now) * math.min(eta, PREDICT_MAX)
+                    -- its lane when the bait gets there, from its path. A fish
+                    -- whose path isn't solved yet is only where it was last
+                    -- seen (often frozen out of view), so it counts for less
+                    local pp = predictPos(f, now + eta)
+                    local lat = (pp or pos):Dot(axis)
+                    if pp then why.known = (why.known or 0) + 1 end
                     local keep = goalPointer(lat, half) ~= nil
                     if not keep then why.reach = why.reach + 1 end
                     if keep then why.ok = why.ok + 1 end
                     if keep then
-                        cands[#cands + 1] = { f = f, y = pos.Y, lat = lat, worth = routeWorth(f) }
+                        local worth = routeWorth(f)
+                        if not pp then worth = worth * 0.5 end
+                        cands[#cands + 1] = { f = f, y = pos.Y, lat = lat, worth = worth, known = pp ~= nil }
                     end
                 end
             end
@@ -1850,7 +2170,14 @@ local function renderStep(dt)
         else
             Steer.hookedFor = 0
         end
-        if eta > INTERCEPT_HORIZON then
+        local tp = predictPos(target, os.clock() + math.max(gap, 0) / math.max(Cast.rise or 10, 2))
+        Steer.targetKnown = tp ~= nil
+        if tp then
+            -- its path is known: be in the lane it will be in when the bait
+            -- reaches it. That lane doesn't move as the bait rises, so the
+            -- bait goes there once and waits instead of chasing
+            goalLat = tp:Dot(axis)
+        elseif eta > INTERCEPT_HORIZON then
             -- still a way off: sit in its average lane, don't chase each dart
             goalLat = Steer.tLat
         else
@@ -1922,13 +2249,34 @@ local function renderStep(dt)
                     local gap = pos.Y - baitPos.Y
                     local lat = pos:Dot(axis)
                     local vel = fishVelocity(f, lat, now)
-                    -- still above the bait only: one riding just below is
-                    -- already hooked and dodging it does nothing
-                    if gap > -0.5 and gap < limit then
-                        local eta = math.max(gap, 0) / rise
+                    local hy = (f.halfY or 1.25) * FISH_MAGNET
+                    -- still above the bait's grab point only: one riding just
+                    -- below is already hooked and dodging it does nothing
+                    if gap + hy > 0 and gap - hy < limit then
+                        local eta = math.max(gap - hy, 0) / rise
+                        local lo, hi
+                        local known = predictPos(f, now) ~= nil
+                        if known then
+                            -- the game grabs whatever crosses the bait at any
+                            -- moment while the bait is inside the fish's
+                            -- height, so a fast fish blocks every lane it
+                            -- sweeps through in that time, not one spot
+                            local t1 = now + eta
+                            local t2 = now + math.max(gap + hy, 0) / rise + 0.05
+                            for k = 0, 4 do
+                                local q = predictPos(f, t1 + (t2 - t1) * k / 4)
+                                local ql = q:Dot(axis)
+                                lo = lo and math.min(lo, ql) or ql
+                                hi = hi and math.max(hi, ql) or ql
+                            end
+                        else
+                            local l = lat + vel * math.min(eta, 0.6)
+                            lo, hi = l, l
+                        end
                         hazards[#hazards + 1] = {
-                            lat = lat + vel * math.min(eta, 0.6),
-                            r = f.halfWidth * FISH_MAGNET + pad,
+                            lo = lo, hi = hi,
+                            -- a known path needs less margin than a guess
+                            r = f.halfWidth * FISH_MAGNET + (known and pad - 0.5 or pad),
                             eta = eta,
                         }
                     end
@@ -1936,7 +2284,7 @@ local function renderStep(dt)
             end
         end
         if #hazards > 0 then
-            local lim = math.min(MAX_OFFSET, POINTER_LIMIT * half)
+            local lim = MAX_OFFSET
             local here = baitPos:Dot(axis)
             local want = goalLat
             -- idle (nothing to chase): barely care where, mostly care clear
@@ -1947,12 +2295,13 @@ local function renderStep(dt)
                 if tLo and (x < tLo or x > tHi) then cost = cost + missCost end
                 for _, h in ipairs(hazards) do
                     local urgency = 1 / (0.15 + h.eta)
-                    local overlap = h.r - math.abs(x - h.lat)
+                    local dist = math.max(h.lo - x, 0, x - h.hi)
+                    local overlap = h.r - dist
                     if overlap > 0 then
                         cost = cost + (20 + overlap * 5) * urgency
                     end
                     if h.eta < 0.6 then
-                        local lo, hi = h.lat - h.r, h.lat + h.r
+                        local lo, hi = h.lo - h.r, h.hi + h.r
                         local a, b = math.min(here, x), math.max(here, x)
                         local inside = here > lo and here < hi
                         if not inside and a < hi and b > lo then
@@ -1969,7 +2318,7 @@ local function renderStep(dt)
     -- a lead can overshoot past where the bait can go; hold it at the edge
     -- of reach instead of giving up on the fish
     if goalLat and Steer.landing and half then
-        local lim = math.min(MAX_OFFSET, POINTER_LIMIT * half)
+        local lim = MAX_OFFSET
         goalLat = math.clamp(goalLat, Steer.landing - lim, Steer.landing + lim)
     end
 
@@ -2441,6 +2790,15 @@ local boxRows = {
         local left, cap = slotsLeft()
         return string.format("Slots: %d / %d free", left, cap)
     end,
+    function()
+        if (Cast.depth or 0) <= 0 or #School == 0 then return nil end
+        local known = 0
+        for _, f in ipairs(School) do
+            local rec = f.id and Paths.fish[f.id]
+            if rec and rec.good then known = known + 1 end
+        end
+        return string.format("Paths known: %d / %d fish", known, #School)
+    end,
     function() return "Event: " .. (txt(R.event) or "?") end,
     function() return "Catches: " .. tostring(Stats.catches) end,
     function()
@@ -2531,7 +2889,8 @@ end
 
 Hub.debug = {
     S = S, R = R, Odds = Odds, Stats = Stats, Cast = Cast, Steer = Steer, Guard = Guard, CatchLog = CatchLog,
-    AimMem = AimMem, AimFit = AimFit,
+    AimMem = AimMem, AimFit = AimFit, Paths = Paths, predictPos = predictPos,
+    Bait = function() return MyBait end,
     School = function() return School end, holdTime = holdTime,
     rodSlotKey = rodSlotKey, inventoryFull = inventoryFull, findStaff = findStaff, validWebhook = validWebhook,
 }
