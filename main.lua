@@ -69,6 +69,7 @@ local S = {
     avoidJunk = true,
     steerSpeed = 4,
     steerMode = "Direct", -- the only steering mode
+    snipe = false, -- Exploits tab: park outside the fish and jump onto targets (see renderStep)
     goForItems = true,
     targetMode = "Value",
     minValue = 0, -- 0 = Auto: no fixed floor, the planner keeps the best fish for the slots
@@ -1062,6 +1063,22 @@ function AimMem.write(offset, half, sign, chasing)
     AimMem.held = true
 end
 
+-- Jump: put the bait at an offset at once. Writing AimOffset itself skips
+-- the game's easing: the bait is there on the game's next frame and never
+-- passes through anything in between. Only the jump is written that way;
+-- holding still is left to the pointer (AimMem.write and its correction),
+-- because Matcha's render callback runs slower than the game, and between
+-- our writes the game eases AimOffset toward where the pointer says.
+-- force: write it every frame (a strike follows a fast-moving fish)
+function AimMem.jump(offset, half, sign, force)
+    offset = math.clamp(offset, -MAX_OFFSET, MAX_OFFSET)
+    if force or not AimMem.lastJump or math.abs(offset - AimMem.lastJump) > 1 then
+        pcall(memory_write, "double", AimMem.aim, offset)
+        AimMem.lastJump = offset
+    end
+    AimMem.write(offset, half, sign, false)
+end
+
 -- nothing is locked, so there is nothing to hand back
 function AimMem.release()
     AimMem.held = false
@@ -1606,6 +1623,38 @@ local function laneLimits(axis, half)
     return lo, hi
 end
 
+-- Where the bait waits between strikes: just outside the band on the side
+-- nearer the bait's base (smaller pointer), past the longest fish's reach.
+-- Sticks to one side so it doesn't flip back and forth.
+local PARK_MARGIN = 2.5
+local function parkLane(axis, half)
+    if not (Paths.center and Paths.ax and Steer.landing) then return nil end
+    laneLimits(axis, half)
+    local cl = Steer.bandCenter
+    if not cl then return nil end
+    local maxHalf = 1.25
+    for _, f in ipairs(School) do
+        if f.halfWidth and f.halfWidth > maxHalf then maxHalf = f.halfWidth end
+    end
+    local spread = PATH_HALF * math.abs(Paths.ax * axis.X + Paths.az * axis.Z)
+    local d = spread + maxHalf * FISH_MAGNET + PARK_MARGIN
+    local function ok(side)
+        return side and math.abs(cl + side * d - Steer.landing) <= MAX_OFFSET - 1
+    end
+    if not ok(Steer.parkSide) then
+        local a, b = cl - d, cl + d
+        if ok(-1) and (not ok(1) or math.abs(a - Steer.landing) <= math.abs(b - Steer.landing)) then
+            Steer.parkSide = -1
+        elseif ok(1) then
+            Steer.parkSide = 1
+        else
+            Steer.parkSide = nil
+            return nil
+        end
+    end
+    return cl + Steer.parkSide * d
+end
+
 local function planRoute(baitPos, axis, half)
     local baitY, baitLat = baitPos.Y, baitPos:Dot(axis)
     local rise = math.max(Cast.rise or 10, 2)
@@ -1662,19 +1711,22 @@ local function planRoute(baitPos, axis, half)
 
     -- every free slot (13+ with upgrades); the cap only bounds the work
     local n, K = #cands, math.min(left, 30)
+    -- jumping (snipe) gets anywhere between two frames: any fish above can
+    -- follow any other, so the route is simply the best fish for the slots
+    local latSpeed = (S.snipe and S.steerMode == "Direct") and 1e6 or ROUTE_LAT_SPEED
     local best, prevOf = {}, {}
     local topV, topI, topK = 0, nil, 0
     for i = 1, n do
         best[i], prevOf[i] = {}, {}
         local ci = cands[i]
         -- straight from the bait
-        local reach0 = ROUTE_LAT_SPEED * math.max(ci.y - baitY, 0) / rise + ROUTE_SLACK
+        local reach0 = latSpeed * math.max(ci.y - baitY, 0) / rise + ROUTE_SLACK
         if math.abs(ci.lat - baitLat) <= reach0 then
             best[i][1] = ci.worth
         end
         for j = 1, i - 1 do
             local cj = cands[j]
-            local reach = ROUTE_LAT_SPEED * math.max(ci.y - cj.y, 0) / rise + ROUTE_SLACK
+            local reach = latSpeed * math.max(ci.y - cj.y, 0) / rise + ROUTE_SLACK
             if math.abs(ci.lat - cj.lat) <= reach then
                 for k = 1, K - 1 do
                     local v = best[j][k]
@@ -2212,8 +2264,26 @@ local function renderStep(dt)
             -- fish riding under it, or a fight. Don't learn from those moments
             local quiet = not fightNow and (Steer.hookedFor or 0) == 0
                 and os.clock() - (Steer.lastHookAt or -1e9) > 0.6
+                and os.clock() - (Steer.lastJumpAt or -1e9) > 0.3
             AimFit.add(os.clock(), offset, baitPos:Dot(axis), quiet, dt)
             Steer.landing = AimFit.landing
+            -- Snipe jumps too often for that slow fit (it threw away the
+            -- samples around every jump and ended up 17 studs off), and
+            -- every strike lands wherever the base says. While the offset
+            -- holds still, the base is exactly bait minus offset: read it
+            -- straight off.
+            if S.snipe and fightNow == false then
+                local now = os.clock()
+                local steady = Steer.prevOff and math.abs(offset - Steer.prevOff) < 0.03
+                    and now - (Steer.lastJumpAt or -1e9) > 0.15
+                    and now - (Steer.lastHookAt or -1e9) > 0.3
+                if steady then
+                    local b = baitPos:Dot(axis) - offset * AimFit.slope
+                    Steer.snipeBase = Steer.snipeBase and (Steer.snipeBase + (b - Steer.snipeBase) * 0.6) or b
+                end
+                if Steer.snipeBase then Steer.landing = Steer.snipeBase end
+            end
+            Steer.prevOff = offset
         end
     elseif axis then
         local pointer = math.clamp(mouse.X / width * 2 - 1, -1, 1)
@@ -2233,6 +2303,7 @@ local function renderStep(dt)
     elseif not axis then
         Steer.target, Steer.lastPos, Steer.landing = nil, nil, nil
         Steer.route, Steer.routeIds, Steer.routeWorth = nil, nil, 0
+        Steer.snipeBase, Steer.prevOff = nil, nil
         if not casting then
             Steer.caughtCount, Steer.caughtThisCast = nil, nil
             if next(Steer.logged) then Steer.logged = {} end
@@ -2300,6 +2371,49 @@ local function renderStep(dt)
         idleLane = true
     end
 
+    -- Snipe: the bait waits in open water just outside the band the fish
+    -- swim in (nothing ever swims there, so nothing gets caught) and jumps
+    -- onto its target only while rising through that fish's height, then
+    -- straight back out. The jump writes the game's own sideways offset, so
+    -- it happens between two frames: the bait never passes the fish in
+    -- between, and the game only checks for a catch where the bait is.
+    local snipe = false
+    Steer.striking = false
+    if S.snipe and direct and axis and Steer.landing and half and aimLive and not fightNow then
+        local park = parkLane(axis, half)
+        if park then
+            snipe = true
+            goalLat, idleLane = park, false
+            if target and targetPos then
+                local gap = targetPos.Y - baitPos.Y
+                local hy = (target.halfY or 1.25) * FISH_MAGNET
+                local now = os.clock()
+                if gap <= hy + 0.25 and gap >= -0.3 then
+                    -- inside its height: on it, exactly where it is now
+                    if Steer.strikeId ~= target.id then
+                        Steer.strikeId, Steer.strikeAt = target.id, now
+                        Steer.snipeStrikes = (Steer.snipeStrikes or 0) + 1
+                    end
+                    local tp = predictPos(target, now + 0.02) or targetPos
+                    goalLat = tp:Dot(axis)
+                    Steer.striking = true
+                    -- the cast counter went up since the strike began: got it
+                    if Steer.lastHookAt and Steer.lastHookAt >= Steer.strikeAt then
+                        Steer.snipeHits = (Steer.snipeHits or 0) + 1
+                        Steer.caught[target.id or 0] = true
+                        Steer.target, Steer.clock = nil, 1
+                        goalLat, Steer.striking = park, false
+                    end
+                elseif gap < -0.3 and Steer.strikeId == target.id then
+                    -- went past it, caught or not: next one
+                    Steer.caught[target.id or 0] = true
+                    Steer.target, Steer.clock = nil, 1
+                end
+            end
+        end
+    end
+    Steer.snipeActive = snipe
+
     -- Dodging: one lane picker instead of stacked rules. Every reachable lane
     -- (half a stud apart) gets a cost and the cheapest wins:
     --   * distance from where the plan wants the bait (the target's lane)
@@ -2310,7 +2424,7 @@ local function renderStep(dt)
     -- Each fish's position is predicted to the moment the bait reaches its
     -- height, from how fast that fish is swimming; dodging where fish were
     -- let them swim into the path.
-    if goalLat and Steer.landing and half then
+    if goalLat and Steer.landing and half and not snipe then
         local hazards = {}
         local rise = math.max(Cast.rise or 10, 2)
         local window = rise * 1.2
@@ -2420,7 +2534,7 @@ local function renderStep(dt)
 
     -- a lead can overshoot past where the bait can go; hold it at the edge
     -- of reach instead of giving up on the fish
-    if goalLat and Steer.landing and half then
+    if goalLat and Steer.landing and half and not snipe then
         local laneLo, laneHi = laneLimits(axis, half)
         goalLat = math.clamp(goalLat, laneLo, laneHi)
     end
@@ -2431,9 +2545,14 @@ local function renderStep(dt)
     if direct then
         local paused = S.staffGuard and Guard.staff
         if goalLat and Steer.landing and aimLive and not fightNow and not paused then
-            Steer.dbgGoal = goalLat
             local offset = math.clamp((goalLat - Steer.landing) / AimFit.slope, -MAX_OFFSET, MAX_OFFSET)
-            AimMem.write(offset, half, AimFit.slope, targetPos ~= nil)
+            if snipe then
+                if not Steer.dbgGoal or math.abs(goalLat - Steer.dbgGoal) > 2 then Steer.lastJumpAt = os.clock() end
+                AimMem.jump(offset, half, AimFit.slope, Steer.striking)
+            else
+                AimMem.write(offset, half, AimFit.slope, targetPos ~= nil)
+            end
+            Steer.dbgGoal = goalLat
             if S.fishEsp and targetPos then
                 local scr, vis = WorldToScreen(targetPos)
                 targetRing.Visible = vis == true
@@ -2677,7 +2796,7 @@ sSteer:Toggle("Avoid useless", S.avoidJunk, function(on) S.avoidJunk = on end, "
 -- instead of an old saved number). Auto: no fixed floor. Slots come from the
 -- game's own caught/cap counter, so upgrades need no setting change, and the
 -- planner keeps the most valuable fish for them, dodging the rest.
-sSteer:Dropdown("Min fish value", { S.minValue <= 0 and "Auto" or fmtShort(S.minValue) }, { "Auto", "$100", "$500", "$1K", "$10K", "$100K" }, false, function(v)
+sSteer:Dropdown("Min fish value", { S.minValue <= 0 and "Auto" or fmtShort(S.minValue) }, { "Auto", "$1K", "$10K", "$25K", "$50K", "$100K", "$250K", "$500K", "$1M", "$2.5M", "$5M" }, false, function(v)
     v = (type(v) == "table" and v[1]) or v
     if v == "Auto" then
         S.minValue = 0
@@ -2705,6 +2824,30 @@ end)
 local sEsp = tFish:Section("Fish ESP", "Right")
 UI.fishEsp = sEsp:Toggle("Show fish", S.fishEsp, function(on) S.fishEsp = on end, "name and value over the school while you cast")
 sEsp:Toggle("Show junk", S.espJunk, function(on) S.espJunk = on end)
+
+Lib:Category("EXPLOITS")
+local tExp = win:Tab("Exploits", "zap")
+local sSnipe = tExp:Section("Bait snipe", "Left", "jump the bait onto the best fish")
+UI.snipe = sSnipe:Toggle("Bait snipe", S.snipe, function(on) S.snipe = on end, "parks the bait in empty water and jumps it onto each target")
+sSnipe:Label(function()
+    if not S.snipe then return "Off" end
+    if not S.autoSteer then return "Needs Auto steer on (Fishing tab)" end
+    if (Cast.depth or 0) <= 0 then return "Waiting for a cast" end
+    if not Steer.snipeActive then return "Reading the school..." end
+    local t = Steer.target
+    if Steer.striking and t then return "Striking: " .. t.name .. "  " .. fmtShort(t.price) end
+    return "Parked" .. (t and ("  next: " .. t.name .. " " .. fmtShort(t.price)) or "")
+end)
+sSnipe:Label(function()
+    return string.format("Strikes: %d   caught: %d", Steer.snipeStrikes or 0, Steer.snipeHits or 0)
+end)
+local sSnipeInfo = tExp:Section("How it works", "Right")
+sSnipeInfo:Label(function() return "Fish only swim 20 studs either side" end)
+sSnipeInfo:Label(function() return "of the center. The bait waits just" end)
+sSnipeInfo:Label(function() return "outside that, so nothing is caught," end)
+sSnipeInfo:Label(function() return "and jumps onto a planned fish only" end)
+sSnipeInfo:Label(function() return "while rising through its height." end)
+sSnipeInfo:Label(function() return "Junk and cheap fish are never touched." end)
 
 Lib:Category("INFO")
 local tInfo = win:Tab("Session", "gauge")
