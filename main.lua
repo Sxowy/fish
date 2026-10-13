@@ -3122,22 +3122,60 @@ sSell:Label(function()
 end)
 
 local sLock = tExp:Section("Auto lock (Pro)", "Right", "the game's own lock-by-rarity setting")
+-- Pick any rarities. The game's lock setting is one rarity "and rarer"
+-- (the server stores a single rank), and single fish can't be locked from
+-- here because the game never shows their inventory ids. So the setting
+-- becomes the lowest rarity picked: everything picked is locked, plus any
+-- rarity between picks. Locking extra only ever keeps fish from being sold.
+local LOCKABLE = {}
+for i = 2, #LOCK_RARITIES do LOCKABLE[#LOCKABLE + 1] = LOCK_RARITIES[i] end
+local function lockRank(r) return table.find(LOCKABLE, r) end
+local function lockedFrom(setting)
+    local out = {}
+    local from = lockRank(setting or "None")
+    if from then for i = from, #LOCKABLE do out[#out + 1] = LOCKABLE[i] end end
+    return out
+end
+Pro.lockPicks = lockedFrom(Pro.autoLockSetting())
 sLock:Label(function()
     local cur = Pro.autoLockSetting()
-    return "Game setting now: " .. (cur or "?") .. (cur and cur ~= "None" and " and rarer" or "")
+    if not cur then return "Game setting: ?" end
+    if cur == "None" then return "Game setting: nothing locked" end
+    return "Game setting: " .. cur .. " and rarer"
 end)
-sLock:Dropdown("Lock new catches", { "Pick to change" }, LOCK_RARITIES, false, function(v)
-    v = (type(v) == "table" and v[1]) or v
-    if not v or v == "Pick to change" then return end
-    -- already set that way: nothing to send
-    if v == Pro.autoLockSetting() then return end
+sLock:Label(function()
+    local cur = Pro.autoLockSetting()
+    local from = lockRank(cur or "None")
+    if not from then return "Picked: none" end
+    -- rarities the game locks that weren't picked (between picks)
+    local picked = {}
+    for _, r in ipairs(Pro.lockPicks or {}) do picked[r] = true end
+    local extra = {}
+    for i = from, #LOCKABLE do
+        if not picked[LOCKABLE[i]] then extra[#extra + 1] = LOCKABLE[i] end
+    end
+    if #extra == 0 then return "Locks exactly what you picked" end
+    return "Also locks: " .. table.concat(extra, ", ")
+end)
+sLock:Dropdown("Lock rarities", Pro.lockPicks, LOCKABLE, true, function(v)
+    local picks = type(v) == "table" and v or { v }
+    Pro.lockPicks = picks
+    -- the lowest pick decides the game setting
+    local low
+    for _, r in ipairs(picks) do
+        local rk = lockRank(r)
+        if rk and (not low or rk < low) then low = rk end
+    end
+    local want = low and LOCKABLE[low] or "None"
+    if want == Pro.autoLockSetting() then return end -- already set that way
     if not Pro.hybrid then
         Lib:Notify("Auto lock", "Needs Matcha's Hybrid Mode (a Matcha Pro feature).", 5, "warning")
         return
     end
-    local ok, msg = Pro.setAutoLock(v)
-    Lib:Notify("Auto lock", ok and ("Locking new " .. v .. " catches and rarer") or ("Not changed: " .. tostring(msg)), 4, ok and "success" or "warning")
-end, "locked fish are never sold, by you or by auto sell")
+    local ok, msg = Pro.setAutoLock(want)
+    local what = want == "None" and "Auto lock off" or ("Locking new " .. want .. " catches and rarer")
+    Lib:Notify("Auto lock", ok and what or ("Not changed: " .. tostring(msg)), 4, ok and "success" or "warning")
+end, "new catches of these rarities get locked; locked fish are never sold")
 
 local sUp = tExp:Section("Auto upgrades (Pro)", "Right", "buys upgrades when you can afford them")
 UI.autoUpgrade = sUp:Toggle("Auto upgrades", S.autoUpgrade, function(on)
