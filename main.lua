@@ -73,6 +73,9 @@ local S = {
     autoSell = false, -- Pro mode only (Matcha Hybrid Mode)
     sellEvery = 1,    -- casts between sells
     sellKeep = "Sell all",
+    autoUpgrade = false, -- Pro mode only
+    upgradeReserve = 0,
+    upCapacity = true, upStrength = true, upWeight = true, upBounce = true,
     goForItems = true,
     targetMode = "Value",
     minValue = 0, -- 0 = Auto: no fixed floor, the planner keeps the best fish for the slots
@@ -1906,6 +1909,120 @@ function Pro.sellAll(under)
     return ok, ok and "sent" or tostring(res)
 end
 
+-- Warp "Fire" events (Lock, Upgrades, ...) send their arguments packed in
+-- Warp's own format: a list marker (-2), the count (u16), then each value
+-- with a type byte (6 = short string, 5 = boolean). Same bytes as the
+-- game's packer (Warp Util.Buffer.Dedicated:pack) for these types.
+local function warpPack(args)
+    local size = 3
+    for _, v in ipairs(args) do
+        if type(v) == "string" then size = size + 2 + #v else size = size + 2 end
+    end
+    local b = buffer.create(size)
+    local p = 0
+    buffer.writei8(b, p, -2) p = p + 1
+    buffer.writeu16(b, p, #args) p = p + 2
+    for _, v in ipairs(args) do
+        if type(v) == "string" then
+            buffer.writei8(b, p, 6) p = p + 1
+            buffer.writeu8(b, p, #v) p = p + 1
+            buffer.writestring(b, p, v) p = p + #v
+        else
+            buffer.writei8(b, p, 5) p = p + 1
+            buffer.writeu8(b, p, v and 1 or 0) p = p + 1
+        end
+    end
+    return b
+end
+
+-- send a Warp event the way the game's client does (Events.Client(name):Fire(true, ...))
+function Pro.fire(name, ...)
+    if not Pro.hybrid then return false, "needs Hybrid Mode" end
+    if type(buffer) ~= "table" or not buffer.create then return false, "this Matcha has no buffer support" end
+    Pro.ids = Pro.ids or {}
+    Pro.ids[name] = Pro.ids[name] or warpId(name)
+    local id = Pro.ids[name]
+    if not id then return false, name .. " request not found" end
+    local ev = warpEvent()
+    local rel = ev and ev:FindFirstChild("Reliable")
+    if not rel then return false, "no reliable channel" end
+    local args = { ... }
+    local ok, res = pcall(function()
+        return rel:FireServer(buffer.fromstring(string.char(id)), warpPack(args))
+    end)
+    if ok and res == false then return false, "Hybrid Mode is off" end
+    return ok, ok and "sent" or tostring(res)
+end
+
+-- Auto lock: the game's own server-side setting (Settings > Auto Lock)
+-- that locks every new catch of a rarity or better. Locked fish are never
+-- sold. This mirrors it: shows what it's set to and changes it only when
+-- the player picks a different rarity here.
+local LOCK_RARITIES = { "None", "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Secret", "Exotic", "Exclusive" }
+function Pro.autoLockSetting()
+    local ok, v = pcall(function()
+        return pg.Interfaces.Settings.Content.ScrollingFrame.AutoLock.Content.Button.Rarity.Text
+    end)
+    return ok and v or nil
+end
+function Pro.setAutoLock(rarity)
+    if not table.find(LOCK_RARITIES, rarity) then return false, "unknown rarity" end
+    return Pro.fire("Lock", "AutoLock", rarity)
+end
+
+-- Auto upgrades: buys the next level of the chosen upgrades when the cash
+-- is there. Prices are read off the game's Upgrades screen (it lives in the
+-- GUI even while closed); the server checks the price and the cash again.
+local UPGRADE_ORDER = { "Capacity", "Strength", "Weight", "Bounce" }
+local function upgradeRow(name)
+    local ok, row = pcall(function() return pg.Interfaces.Upgrades.Content[name] end)
+    return ok and row or nil
+end
+function Pro.upgradePrice(name)
+    local row = upgradeRow(name)
+    if not row then return nil end
+    local ok, txtv = pcall(function() return row.Buttons.BuyCoins.Price.Text end)
+    if not ok or type(txtv) ~= "string" then return nil end
+    if txtv:upper():find("MAX") then return nil end
+    return num(txtv)
+end
+function Pro.buyUpgrade(name)
+    return Pro.fire("Upgrades", "Buy", name)
+end
+
+-- one purchase per pass, between casts, keeping the cash reserve
+task.spawn(function()
+    while Hub.running do
+        task.wait(4)
+        pcall(function()
+            if not (S.autoUpgrade and Pro.hybrid) then return end
+            if (Cast.depth or 0) > 0 or Cast.fighting then return end
+            local cash = num(txt(R.cash))
+            if not cash then return end
+            local reserve = tonumber(S.upgradeReserve) or 0
+            -- Capacity first (more fish per cast), then the cheapest
+            local best, bestPrice
+            for _, name in ipairs(UPGRADE_ORDER) do
+                if S["up" .. name] then
+                    local price = Pro.upgradePrice(name)
+                    if price and cash - price >= reserve then
+                        if name == "Capacity" then best, bestPrice = name, price break end
+                        if not bestPrice or price < bestPrice then best, bestPrice = name, price end
+                    end
+                end
+            end
+            if best then
+                local ok, msg = Pro.buyUpgrade(best)
+                Pro.lastUpgrade = { at = os.clock(), name = best, price = bestPrice, ok = ok, msg = msg }
+                if ok then
+                    Lib:Notify("Auto upgrade", "Bought " .. best .. " for " .. fmtShort(bestPrice), 4, "success")
+                end
+                task.wait(3)
+            end
+        end)
+    end
+end)
+
 local SELL_KEEP = { ["Sell all"] = nil, ["Keep $100K+"] = 1e5, ["Keep $1M+"] = 1e6, ["Keep $10M+"] = 1e7 }
 local SELL_KEEP_ORDER = { "Sell all", "Keep $100K+", "Keep $1M+", "Keep $10M+" }
 
@@ -2973,7 +3090,7 @@ sSnipeInfo:Label(function() return "and jumps onto a planned fish only" end)
 sSnipeInfo:Label(function() return "while rising through its height." end)
 sSnipeInfo:Label(function() return "Junk and cheap fish are never touched." end)
 
-local sSell = tExp:Section("Auto sell (Pro)", "Left", "sells without walking to the shop")
+local sSell = tExp:Section("Auto sell (Pro, experimental)", "Left", "the server may only accept it at the shop")
 sSell:Label(function()
     if not Pro.checked then return "Checking Matcha mode..." end
     if Pro.hybrid then return "Pro mode: Hybrid Mode is on" end
@@ -3002,6 +3119,52 @@ sSell:Label(function()
     local ago = math.floor(os.clock() - l.at)
     if not l.ok then return "Last sell failed: " .. tostring(l.msg) end
     return string.format("Last sell: %s, %ds ago", l.gain and ("+" .. fmtShort(l.gain)) or "sent", ago)
+end)
+
+local sLock = tExp:Section("Auto lock (Pro)", "Right", "the game's own lock-by-rarity setting")
+sLock:Label(function()
+    local cur = Pro.autoLockSetting()
+    return "Game setting now: " .. (cur or "?") .. (cur and cur ~= "None" and " and rarer" or "")
+end)
+sLock:Dropdown("Lock new catches", { "Pick to change" }, LOCK_RARITIES, false, function(v)
+    v = (type(v) == "table" and v[1]) or v
+    if not v or v == "Pick to change" then return end
+    -- already set that way: nothing to send
+    if v == Pro.autoLockSetting() then return end
+    if not Pro.hybrid then
+        Lib:Notify("Auto lock", "Needs Matcha's Hybrid Mode (a Matcha Pro feature).", 5, "warning")
+        return
+    end
+    local ok, msg = Pro.setAutoLock(v)
+    Lib:Notify("Auto lock", ok and ("Locking new " .. v .. " catches and rarer") or ("Not changed: " .. tostring(msg)), 4, ok and "success" or "warning")
+end, "locked fish are never sold, by you or by auto sell")
+
+local sUp = tExp:Section("Auto upgrades (Pro)", "Right", "buys upgrades when you can afford them")
+UI.autoUpgrade = sUp:Toggle("Auto upgrades", S.autoUpgrade, function(on)
+    S.autoUpgrade = on
+    if on and Pro.checked and not Pro.hybrid then
+        Lib:Notify("Auto upgrades", "Needs Matcha's Hybrid Mode (a Matcha Pro feature).", 6, "warning")
+    end
+end, "Capacity first, then the cheapest; one purchase every few seconds between casts")
+for _, name in ipairs(UPGRADE_ORDER) do
+    sUp:Toggle(name, S["up" .. name], function(on) S["up" .. name] = on end)
+end
+sUp:Dropdown("Always keep", { S.upgradeReserve <= 0 and "$0" or fmtShort(S.upgradeReserve) }, { "$0", "$1M", "$10M", "$50M", "$100M", "$500M" }, false, function(v)
+    v = (type(v) == "table" and v[1]) or v or "$0"
+    S.upgradeReserve = num(tostring(v):gsub("%$", "")) or 0
+end, "cash that auto upgrades never spends")
+sUp:Label(function()
+    local parts = {}
+    for _, name in ipairs(UPGRADE_ORDER) do
+        local p = Pro.upgradePrice(name)
+        parts[#parts + 1] = name:sub(1, 3) .. " " .. (p and fmtShort(p) or "max")
+    end
+    return "Next: " .. table.concat(parts, "  ")
+end)
+sUp:Label(function()
+    local u = Pro.lastUpgrade
+    if not u then return "Last: -" end
+    return string.format("Last: %s %s (%s)", u.name, fmtShort(u.price), u.ok and "sent" or tostring(u.msg))
 end)
 
 Lib:Category("INFO")
