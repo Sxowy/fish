@@ -9,6 +9,175 @@
 _G.DeepFishLoadId = (_G.DeepFishLoadId or 0) + 1
 local myLoad = _G.DeepFishLoadId
 
+-- Loading screen. Plain Drawing objects on a render callback, so it keeps
+-- animating while the script loads. main() reports each real step through
+-- Splash.step, which also yields a frame so the change gets drawn.
+local Splash = {}
+do
+    local RunService = game:GetService("RunService")
+    local ACCENT = Color3.fromRGB(140, 120, 255)
+    local ACCENT2 = Color3.fromRGB(110, 205, 255)
+    local TEXT = Color3.fromRGB(205, 205, 222)
+    local CARD_W, CARD_H, PAD = 440, 196, 26
+    local Z = 300
+    local items, conn = {}, nil
+    local st = { target = 0, shown = 0, text = "Starting", alpha = 0, phase = "off", closeAt = nil, err = nil }
+
+    local function add(kind, props, layer)
+        local ok, d = pcall(Drawing.new, kind)
+        if not ok or not d then error("no Drawing") end
+        for k, v in pairs(props) do pcall(function() d[k] = v end) end
+        pcall(function() d.ZIndex = Z + (layer or 0) end)
+        pcall(function() d.Visible = false end)
+        items[#items + 1] = { d = d, base = props.Transparency or 0 }
+        return d
+    end
+
+    local shadow, card, edge, strip, fishBody, fishTail, fishEye, kicker, title, sub
+    local status, pctText, barBg, barFill, shine, tip
+    local bubbles = {}
+
+    local function build()
+        shadow = add("Square", { Filled = true, Color = Color3.fromRGB(0, 0, 0), Transparency = 0.55, Rounding = 16 }, 0)
+        card = add("Square", { Filled = true, Color = Color3.fromRGB(15, 15, 21), Transparency = 0.03, Rounding = 14 }, 1)
+        edge = add("Square", { Filled = false, Thickness = 1, Color = Color3.fromRGB(70, 62, 140), Transparency = 0.2, Rounding = 14 }, 2)
+        strip = add("Square", { Filled = true, Color = ACCENT, Rounding = 2 }, 3)
+        for i = 1, 8 do
+            bubbles[i] = {
+                d = add("Circle", { Filled = false, Thickness = 1, NumSides = 16, Color = ACCENT2, Transparency = 0.6 }, 2),
+                x = math.random(), speed = 0.07 + math.random() * 0.08, off = math.random(), r = 2 + math.random() * 3,
+            }
+        end
+        fishBody = add("Circle", { Filled = true, NumSides = 24, Color = ACCENT, Radius = 11 }, 4)
+        fishTail = add("Triangle", { Filled = true, Color = ACCENT }, 4)
+        fishEye = add("Circle", { Filled = true, NumSides = 10, Color = Color3.fromRGB(15, 15, 21), Radius = 2 }, 5)
+        kicker = add("Text", { Text = "M A T C H A   S C R I P T", Size = 12, Font = 2, Color = ACCENT2 }, 4)
+        title = add("Text", { Text = "Deep Fishing", Size = 30, Font = 11, Color = Color3.fromRGB(238, 236, 255) }, 4)
+        sub = add("Text", { Text = "smart steering, bait snipe and live stats", Size = 14, Font = 0, Color = Color3.fromRGB(150, 148, 175) }, 4)
+        status = add("Text", { Text = "", Size = 14, Font = 0, Color = TEXT }, 4)
+        pctText = add("Text", { Text = "0%", Size = 14, Font = 2, Color = TEXT }, 4)
+        barBg = add("Square", { Filled = true, Color = Color3.fromRGB(34, 33, 48), Rounding = 4 }, 4)
+        barFill = add("Square", { Filled = true, Color = ACCENT, Rounding = 4 }, 5)
+        shine = add("Square", { Filled = true, Color = ACCENT2, Transparency = 0.45, Rounding = 4 }, 6)
+        tip = add("Text", { Text = "P opens the menu   |   F6 toggles auto cast", Size = 12, Font = 0, Color = Color3.fromRGB(110, 108, 135) }, 4)
+    end
+
+    local function textWidth(d)
+        local ok, b = pcall(function() return d.TextBounds end)
+        return ok and b and b.X or 0
+    end
+
+    local function frame(dt)
+        dt = math.min(dt or 0.016, 0.1)
+        local now = os.clock()
+        local vp = workspace.CurrentCamera.ViewportSize
+        local x0, y0 = math.floor(vp.X / 2 - CARD_W / 2), math.floor(vp.Y / 2 - CARD_H / 2)
+
+        -- fade in, hold, fade out
+        if st.phase == "in" then
+            st.alpha = math.min(1, st.alpha + dt / 0.35)
+            if st.alpha >= 1 then st.phase = "on" end
+        elseif st.phase == "out" then
+            st.alpha = math.max(0, st.alpha - dt / 0.45)
+        end
+        if st.closeAt and now >= st.closeAt and st.phase ~= "out" then st.phase = "out" end
+
+        -- the bar eases toward the last reported step
+        st.shown = st.shown + (st.target - st.shown) * math.min(1, dt * 5)
+
+        -- slides up a little while fading in
+        local y = y0 + (1 - st.alpha) * 12
+        shadow.Position = Vector2.new(x0 + 4, y + 8)
+        shadow.Size = Vector2.new(CARD_W, CARD_H)
+        card.Position = Vector2.new(x0, y)
+        card.Size = Vector2.new(CARD_W, CARD_H)
+        edge.Position = card.Position
+        edge.Size = card.Size
+        strip.Position = Vector2.new(x0 + PAD, y)
+        strip.Size = Vector2.new(CARD_W - PAD * 2, 3)
+
+        -- fish logo, bobbing
+        local fx, fy = x0 + PAD + 22, y + 56 + math.sin(now * 2.2) * 2
+        fishBody.Position = Vector2.new(fx, fy)
+        fishTail.PointA = Vector2.new(fx - 8, fy)
+        fishTail.PointB = Vector2.new(fx - 21, fy - 9)
+        fishTail.PointC = Vector2.new(fx - 21, fy + 9)
+        fishEye.Position = Vector2.new(fx + 5, fy - 3)
+
+        local tx = x0 + PAD + 46
+        kicker.Position = Vector2.new(tx, y + 24)
+        title.Position = Vector2.new(tx, y + 38)
+        sub.Position = Vector2.new(tx, y + 74)
+
+        -- status, percent, bar
+        local barY = y + CARD_H - 58
+        local barW = CARD_W - PAD * 2
+        status.Text = st.err and ("Failed: " .. st.err) or (st.text .. string.rep(".", math.floor(now * 2.5) % 4))
+        status.Color = st.err and Color3.fromRGB(255, 110, 110) or TEXT
+        status.Position = Vector2.new(x0 + PAD, barY - 24)
+        pctText.Text = string.format("%d%%", math.floor(st.shown * 100 + 0.5))
+        pctText.Position = Vector2.new(x0 + CARD_W - PAD - textWidth(pctText), barY - 24)
+        barBg.Position = Vector2.new(x0 + PAD, barY)
+        barBg.Size = Vector2.new(barW, 6)
+        local fillW = math.max(6, barW * st.shown)
+        barFill.Position = barBg.Position
+        barFill.Size = Vector2.new(fillW, 6)
+        barFill.Color = st.err and Color3.fromRGB(230, 80, 80) or ACCENT
+        -- a soft highlight sweeping along the filled part
+        local sw = math.min(44, fillW)
+        shine.Position = Vector2.new(x0 + PAD + ((now * 0.9) % 1) * math.max(fillW - sw, 0), barY)
+        shine.Size = Vector2.new(sw, 6)
+        tip.Position = Vector2.new(x0 + PAD, y + CARD_H - 32)
+
+        -- everything fades together
+        for _, it in ipairs(items) do
+            it.d.Transparency = 1 - (1 - it.base) * st.alpha
+            it.d.Visible = st.alpha > 0.01
+        end
+        -- bubbles drift up the right side, fading in at the bottom and out at the top
+        for _, b in ipairs(bubbles) do
+            local p = (now * b.speed + b.off) % 1
+            b.d.Position = Vector2.new(x0 + CARD_W * 0.62 + b.x * CARD_W * 0.3 + math.sin(now * 1.7 + b.off * 9) * 4,
+                y + CARD_H - 76 - p * (CARD_H - 96))
+            b.d.Radius = b.r
+            b.d.Transparency = 1 - 0.6 * math.sin(p * math.pi) * st.alpha
+        end
+
+        if st.phase == "out" and st.alpha <= 0 then Splash.remove() end
+    end
+
+    function Splash.start()
+        if conn then return end
+        if not pcall(build) then Splash.remove() return end
+        st.phase, st.alpha = "in", 0
+        conn = RunService.RenderStepped:Connect(function(dt) pcall(frame, dt) end)
+        -- never left on screen
+        task.delay(30, function() if conn then Splash.remove() end end)
+    end
+
+    function Splash.step(text, pct)
+        st.text = text or st.text
+        st.target = math.max(st.target, math.clamp(pct or st.target, 0, 1))
+        pcall(task.wait)
+    end
+
+    function Splash.done()
+        st.text, st.target = "Ready", 1
+        st.closeAt = os.clock() + 0.8
+    end
+
+    function Splash.fail(msg)
+        st.err = tostring(msg or "unknown error"):sub(1, 60)
+        st.closeAt = os.clock() + 5
+    end
+
+    function Splash.remove()
+        if conn then pcall(function() conn:Disconnect() end) conn = nil end
+        for _, it in ipairs(items) do pcall(function() it.d.Visible = false it.d:Remove() end) end
+        items = {}
+    end
+end
+
 local function main()
 
 -- The menu library, patched so an error inside one of its frames can't end
@@ -32,7 +201,9 @@ local function loadLib()
     end
     return INSUI
 end
+Splash.step("Loading the menu", 0.15)
 local Lib = loadLib()
+Splash.step("Reading the game", 0.35)
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -531,6 +702,7 @@ local function loadDatabase()
     end
 end
 
+Splash.step("Loading fish prices", 0.5)
 loadDatabase()
 
 local function fishRarity(name)
@@ -2945,6 +3117,7 @@ end)
 -- menu
 ---------------------------------------------------------------------------
 
+Splash.step("Building the menu", 0.7)
 local win = Lib:CreateWindow({
     title = "Deep Fishing",
     subtitle = "auto",
@@ -3363,6 +3536,8 @@ end):SetRisk()
 
 win:AddSettingsTab("gear")
 
+Splash.step("Starting the steering", 0.88)
+
 -- Status box. Drawn by this script with plain Drawing objects (no menu
 -- library involved) and refreshed from a render-frame callback, the same way
 -- the steering runs, ten times a second. A timer thread used to drive it,
@@ -3587,6 +3762,8 @@ task.spawn(function()
     end
     if _G.DeepFishLoadId ~= myLoad then return end
     _G.DeepFishBusy = true
+    Splash.start()
+    Splash.step("Starting", 0.05)
     local previous = _G.DeepFishHub
     _G.DeepFishHub = nil
     if previous and previous.Unload then
@@ -3596,7 +3773,14 @@ task.spawn(function()
     end
     if _G.DeepFishLoadId == myLoad then
         local ok, err = pcall(main)
-        if not ok then warn("[DeepFish] failed to load: " .. tostring(err)) end
+        if ok then
+            Splash.done()
+        else
+            warn("[DeepFish] failed to load: " .. tostring(err))
+            Splash.fail(err)
+        end
+    else
+        Splash.remove() -- a newer execute took over
     end
     _G.DeepFishBusy = false
 end)
